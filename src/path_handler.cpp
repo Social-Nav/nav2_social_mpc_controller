@@ -24,7 +24,7 @@
 #include "nav_2d_utils/tf_help.hpp"
 #include "nav2_social_mpc_controller/tools/path_handler.hpp"
 
-#include "nav2_core/exceptions.hpp"
+#include "nav2_core/planner_exceptions.hpp"
 
 namespace mpc
 {

@@ -20,7 +20,7 @@
 #include <string>
 
 #include "angles/angles.h"
-#include "nav2_core/exceptions.hpp"
+#include "nav2_core/planner_exceptions.hpp"
 #include "nav2_util/geometry_utils.hpp"
 #include "nav2_util/node_utils.hpp"
 #include "pluginlib/class_list_macros.hpp"
@@ -81,7 +81,6 @@ void SocialMPCController::configure(const rclcpp_lifecycle::LifecycleNode::WeakP
       std::make_unique<ObstacleDistInterface>(node, costmap_ros_->getGlobalFrameID(), tf_, transform_tolerance_);
 
   local_path_pub_ = node->create_publisher<nav_msgs::msg::Path>("local_plan", 1);
-
   people_traj_pub_ = node->create_publisher<visualization_msgs::msg::MarkerArray>("people_projected_trajectory", 1);
 }
 
@@ -163,13 +162,27 @@ geometry_msgs::msg::TwistStamped SocialMPCController::computeVelocityCommands(
     const geometry_msgs::msg::PoseStamped& robot_pose, const geometry_msgs::msg::Twist& speed,
     nav2_core::GoalChecker* goal_checker)
 {
-  // Use goal_checker to avoid unused parameter warning
-  if (goal_checker == nullptr)
-  {
-    RCLCPP_WARN(logger_, "Goal checker is null");
-  }
   nav_msgs::msg::Path transformed_plan =
       path_handler_->transformGlobalPlan(robot_pose, 4.0);  // TODO: make this a parameter
+
+  {
+    static rclcpp::Clock entry_dbg_clock(RCL_STEADY_TIME);
+    RCLCPP_WARN_THROTTLE(logger_, entry_dbg_clock, 1000,
+      "[STUCK-DEBUG] computeVelocityCommands ENTER | plan_poses=%zu",
+      transformed_plan.poses.size());
+  }
+
+  if (goal_checker != nullptr && !transformed_plan.poses.empty())
+  {
+    auto & goal_pose = transformed_plan.poses.back().pose;
+    if (goal_checker->isGoalReached(robot_pose.pose, goal_pose, speed))
+    {
+      geometry_msgs::msg::TwistStamped cmd_vel;
+      cmd_vel.header = robot_pose.header;
+      return cmd_vel;
+    }
+  }
+
   auto goal = path_handler_->getTransformedGoal(2.5, transformed_plan, robot_pose);
 
   // Trajectorize the path
@@ -181,10 +194,10 @@ geometry_msgs::msg::TwistStamped SocialMPCController::computeVelocityCommands(
   {
     geometry_msgs::msg::TwistStamped cmd_vel;
     cmd_vel.header = robot_pose.header;
-    cmd_vel.twist.linear.x = 0.1;  // Use the desired speed as a fallback
+    cmd_vel.twist.linear.x = 0.0;
     cmd_vel.twist.linear.y = 0.0;
-    cmd_vel.twist.angular.z = 0.0;  // No angular velocity
-    RCLCPP_WARN(logger_, "Approaching goal without a valid trajectory, using fallback cmd_vel");
+    cmd_vel.twist.angular.z = 0.0;
+    RCLCPP_DEBUG(logger_, "Approaching goal without a valid trajectory, stopping");
     return cmd_vel;
   }
   std::vector<geometry_msgs::msg::TwistStamped> init_cmds = cmds;
@@ -233,6 +246,13 @@ geometry_msgs::msg::TwistStamped SocialMPCController::computeVelocityCommands(
 
   // Get the distance transform
   obstacle_distance_msgs::msg::ObstacleDistance transformed_od = obsdist_interface_->getDistanceTransform();
+  if (!people.people.empty() &&
+      (transformed_od.distances.empty() || transformed_od.indexes.empty() || transformed_od.info.width <= 0 ||
+       transformed_od.info.height <= 0 || transformed_od.info.resolution <= 0.0))
+  {
+    RCLCPP_WARN(logger_, "ObstacleDistance is not ready yet, ignoring /people for this control cycle");
+    people.people.clear();
+  }
 
   float ts = trajectorizer_->getTimeStep();
   AgentsTrajectories projected_people;
@@ -252,7 +272,59 @@ geometry_msgs::msg::TwistStamped SocialMPCController::computeVelocityCommands(
   cmd_vel.twist.linear.x = cmds[0].twist.linear.x;
   cmd_vel.twist.linear.y = 0;
   cmd_vel.twist.angular.z = cmds[0].twist.angular.z;
+
+  // [STUCK-DEBUG] Large-heading-error in-place turn override:
+  // When the path ahead requires a heading change larger than this threshold
+  // (i.e. a U-turn / sharp turn), force zero linear velocity so the robot spins
+  // in place with zero turning radius instead of carving an arc it cannot fit in
+  // a narrow space. Threshold is expressed in radians.
+  const double inplace_turn_min_angle = 1.5708;  // 90 degrees
+  {
+    double robot_yaw = tf2::getYaw(robot_pose.pose.orientation);
+    double rx = robot_pose.pose.position.x;
+    double ry = robot_pose.pose.position.y;
+    // find first pose on the (global-frame) plan that is far enough ahead
+    double heading_err = 0.0;
+    bool found = false;
+    for (const auto & ps : transformed_plan.poses)
+    {
+      double dx = ps.pose.position.x - rx;
+      double dy = ps.pose.position.y - ry;
+      if ((dx * dx + dy * dy) >= 0.25)  // > 0.5 m away
+      {
+        double dir = atan2(dy, dx);
+        heading_err = angles::shortest_angular_distance(robot_yaw, dir);
+        found = true;
+        break;
+      }
+    }
+    if (found && fabs(heading_err) > inplace_turn_min_angle)
+    {
+      // Pure in-place rotation: zero the linear velocity AND take over the angular
+      // velocity toward the target heading. Leaving wz to the optimizer makes it
+      // oscillate/stall on large turns (it keeps trying to follow the path forward).
+      // Use a proportional law (clamped) so the turn is brisk at large errors and
+      // eases in as it aligns, instead of a bang-bang command that jerks at handoff.
+      const double inplace_kp = 2.0;         // rad/s per rad of heading error
+      const double inplace_max_vel = 1.4;    // rad/s ceiling (matches optimizer wz bound)
+      const double inplace_min_vel = 0.6;    // rad/s floor, so it never crawls/stalls
+      double mag = std::clamp(inplace_kp * fabs(heading_err), inplace_min_vel, inplace_max_vel);
+      cmd_vel.twist.linear.x = 0.0;
+      cmd_vel.twist.angular.z = std::copysign(mag, heading_err);
+      static rclcpp::Clock inplace_dbg_clock(RCL_STEADY_TIME);
+      RCLCPP_WARN_THROTTLE(logger_, inplace_dbg_clock, 500,
+        "[STUCK-DEBUG] IN-PLACE TURN: heading_err=%.1f deg -> wz_cmd=%.3f | actual wz=%.3f vx=%.3f (opt wanted wz=%.3f)",
+        heading_err * 180.0 / M_PI, cmd_vel.twist.angular.z, speed.angular.z, speed.linear.x,
+        cmds[0].twist.angular.z);
+    }
+  }
+
   RCLCPP_DEBUG(logger_, "cmd_vel: %f, %f", cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
+  static rclcpp::Clock stuck_dbg_clock(RCL_STEADY_TIME);
+  RCLCPP_INFO_THROTTLE(logger_, stuck_dbg_clock, 500,
+    "[STUCK-DEBUG] optimized=%d | out vx=%.3f wz=%.3f | ref(pre-opt) vx=%.3f wz=%.3f | people_in_fov=%zu",
+    optimized, cmd_vel.twist.linear.x, cmd_vel.twist.angular.z,
+    init_cmds[0].twist.linear.x, init_cmds[0].twist.angular.z, people.people.size());
   return cmd_vel;
 }
 

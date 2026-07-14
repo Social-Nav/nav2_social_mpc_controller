@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.5)
 project(nav2_social_mpc_controller)
 
 set(CMAKE_BUILD_TYPE Release) # significant Ceres optimization speedup
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC -Wno-shadow")
 
 find_package(ament_cmake REQUIRED)
 find_package(nav2_common REQUIRED)
@@ -88,6 +88,8 @@ endforeach()
 target_link_libraries(${library_name} mpc_critics)
 # prevent pluginlib from using boost
 target_compile_definitions(${library_name} PUBLIC "PLUGINLIB__DISABLE_BOOST_FUNCTIONS")
+target_compile_options(${library_name} PRIVATE -Wno-shadow)
+target_compile_options(mpc_critics PRIVATE -Wno-shadow)
 
 install(TARGETS ${library_name} mpc_critics
   ARCHIVE DESTINATION lib

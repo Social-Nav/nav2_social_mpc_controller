@@ -53,6 +53,7 @@ void PathTrajectorizer::configure(rclcpp_lifecycle::LifecycleNode::WeakPtr paren
   declare_parameter_if_not_declared(node, plugin_name_ + ".desired_linear_vel", rclcpp::ParameterValue(0.4));
   declare_parameter_if_not_declared(node, plugin_name_ + ".lookahead_dist", rclcpp::ParameterValue(0.4));
   declare_parameter_if_not_declared(node, plugin_name_ + ".max_angular_vel", rclcpp::ParameterValue(1.0));
+  declare_parameter_if_not_declared(node, plugin_name_ + ".rotate_to_heading_min_angle", rclcpp::ParameterValue(M_PI / 4.0));
   declare_parameter_if_not_declared(node, plugin_name_ + ".transform_tolerance", rclcpp::ParameterValue(0.1));
   declare_parameter_if_not_declared(node, plugin_name_ + ".base_frame", rclcpp::ParameterValue("base_footprint"));
   declare_parameter_if_not_declared(node, plugin_name_ + ".time_step", rclcpp::ParameterValue(0.05));
@@ -62,6 +63,7 @@ void PathTrajectorizer::configure(rclcpp_lifecycle::LifecycleNode::WeakPtr paren
   node->get_parameter(plugin_name_ + ".desired_linear_vel", desired_linear_vel_);
   node->get_parameter(plugin_name_ + ".lookahead_dist", lookahead_dist_);
   node->get_parameter(plugin_name_ + ".max_angular_vel", max_angular_vel_);
+  node->get_parameter(plugin_name_ + ".rotate_to_heading_min_angle", rotate_to_heading_min_angle_);
   node->get_parameter(plugin_name_ + ".base_frame", base_frame_);
   node->get_parameter(plugin_name_ + ".time_step", time_step_);
   double max_time;
@@ -76,6 +78,7 @@ void PathTrajectorizer::configure(rclcpp_lifecycle::LifecycleNode::WeakPtr paren
   RCLCPP_DEBUG(logger_, "desired_linear_vel: %.2f m/s", desired_linear_vel_);
   RCLCPP_DEBUG(logger_, "lookahead_dist: %.2f m", lookahead_dist_);
   RCLCPP_DEBUG(logger_, "max_angular_vel: %.2f rad/s", max_angular_vel_);
+  RCLCPP_DEBUG(logger_, "rotate_to_heading_min_angle: %.2f rad", rotate_to_heading_min_angle_);
   RCLCPP_DEBUG(logger_, "time_step: %.2f secs", time_step_);
   RCLCPP_DEBUG(logger_, "max_time: %.2f secs", max_time);
   RCLCPP_DEBUG(logger_, "base_frame: %s", base_frame_.c_str());
@@ -211,7 +214,7 @@ bool PathTrajectorizer::trajectorize(nav_msgs::msg::Path& path, const geometry_m
       // double angle_to_heading;
 
       // if the angle to the path is too large, rotate in place
-      if (fabs(dtheta) > M_PI / 2.0)
+      if (fabs(dtheta) > rotate_to_heading_min_angle_)
       {
         // rotate in place
         vx = 0.0;

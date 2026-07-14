@@ -147,6 +147,7 @@ protected:
   double desired_linear_vel_;
   double lookahead_dist_;
   double max_angular_vel_;
+  double rotate_to_heading_min_angle_;
   bool omnidirectional_;
   double time_step_;
   double max_steps_;

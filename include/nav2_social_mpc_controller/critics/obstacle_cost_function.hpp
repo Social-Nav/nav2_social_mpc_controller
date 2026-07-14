@@ -92,7 +92,7 @@ public:
     double weight, const nav2_costmap_2d::Costmap2D * costmap,
     const std::shared_ptr<ceres::BiCubicInterpolator<ceres::Grid2D<u_char>>> & costmap_interpolator,
     const geometry_msgs::msg::Pose & robot_init, unsigned int current_position, double time_step,
-    unsigned int control_horizon, unsigned int block_length);
+    unsigned int control_horizon, unsigned int block_length, double offset_sign = 1.0);
 
   /**
   * @brief Creates a Ceres cost function for the ObstacleCost.
@@ -115,11 +115,11 @@ public:
     double weight, const nav2_costmap_2d::Costmap2D * costmap,
     const std::shared_ptr<ceres::BiCubicInterpolator<ceres::Grid2D<u_char>>> & costmap_interpolator,
     const geometry_msgs::msg::Pose & robot_init, unsigned int current_position, double time_step,
-    unsigned int control_horizon, unsigned int block_length)
+    unsigned int control_horizon, unsigned int block_length, double offset_sign = 1.0)
   {
     return new ObstacleCostFunction(new ObstacleCost(
       weight, costmap, costmap_interpolator, robot_init, current_position, time_step,
-      control_horizon, block_length));
+      control_horizon, block_length, offset_sign));
   }
 
   /**
@@ -149,7 +149,7 @@ public:
     // the costmap is a 2D grid, so we need to convert the position to the grid coordinates.
 
     T value_front;
-    const T front_offset = T(0.25);  // considering size of jackal
+    const T front_offset = T(0.25) * T(offset_sign_);
 
     T front_x = new_position_x + front_offset * ceres::cos(new_position_orientation);
     T front_y = new_position_y + front_offset * ceres::sin(new_position_orientation);
@@ -171,6 +171,7 @@ public:
   double time_step_;
   unsigned int current_position_;
   double weight_;
+  double offset_sign_;
   geometry_msgs::msg::Pose robot_init_;
   Eigen::Vector2d costmap_origin_;
   double costmap_resolution_;

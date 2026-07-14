@@ -7,7 +7,7 @@ PeopleInterface::PeopleInterface(rclcpp_lifecycle::LifecycleNode::WeakPtr parent
 {
   auto node = parent.lock();
   people_sub_ = node->create_subscription<people_msgs::msg::People>(
-    "people", rclcpp::SensorDataQoS(),
+    "/people", rclcpp::SensorDataQoS(),
     std::bind(&PeopleInterface::people_callback, this, std::placeholders::_1));
 }
 

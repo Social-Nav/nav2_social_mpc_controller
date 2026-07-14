@@ -73,6 +73,20 @@ void OptimizerParams::get(rclcpp_lifecycle::LifecycleNode* node, const std::stri
   node->get_parameter(weights + "obstacle_weight", obstacle_w_);
   nav2_util::declare_parameter_if_not_declared(node, weights + "goal_align_weight", rclcpp::ParameterValue(0.0));
   node->get_parameter(weights + "goal_align_weight", goal_align_w_);
+  nav2_util::declare_parameter_if_not_declared(node, weights + "social_clear_distance", rclcpp::ParameterValue(2.0));
+  node->get_parameter(weights + "social_clear_distance", social_clear_distance_);
+  nav2_util::declare_parameter_if_not_declared(node, weights + "social_safety_distance", rclcpp::ParameterValue(0.9));
+  node->get_parameter(weights + "social_safety_distance", social_safety_distance_);
+  nav2_util::declare_parameter_if_not_declared(node, weights + "social_mid_gain", rclcpp::ParameterValue(1.0));
+  node->get_parameter(weights + "social_mid_gain", social_mid_gain_);
+  nav2_util::declare_parameter_if_not_declared(node, weights + "social_near_gain", rclcpp::ParameterValue(6.0));
+  node->get_parameter(weights + "social_near_gain", social_near_gain_);
+  nav2_util::declare_parameter_if_not_declared(node, weights + "social_retreat_gain", rclcpp::ParameterValue(8.0));
+  node->get_parameter(weights + "social_retreat_gain", social_retreat_gain_);
+  nav2_util::declare_parameter_if_not_declared(node, weights + "social_retreat_distance", rclcpp::ParameterValue(2.0));
+  node->get_parameter(weights + "social_retreat_distance", social_retreat_distance_);
+  nav2_util::declare_parameter_if_not_declared(node, local_name + "min_linear_velocity", rclcpp::ParameterValue(-0.25));
+  node->get_parameter(local_name + "min_linear_velocity", min_linear_vel_);
   nav2_util::declare_parameter_if_not_declared(node, local_name + "control_horizon", rclcpp::ParameterValue(5));
   node->get_parameter(local_name + "control_horizon", control_horizon_);
   nav2_util::declare_parameter_if_not_declared(node, local_name + "parameter_block_length", rclcpp::ParameterValue(5));
@@ -109,6 +123,13 @@ void Optimizer::initialize(const OptimizerParams params)
   angle_w_ = params.angle_w_;
   agent_angle_w_ = params.agent_angle_w_;
   proxemics_w_ = params.proxemics_w_;
+  social_clear_distance_ = params.social_clear_distance_;
+  social_safety_distance_ = params.social_safety_distance_;
+  social_mid_gain_ = params.social_mid_gain_;
+  social_near_gain_ = params.social_near_gain_;
+  social_retreat_gain_ = params.social_retreat_gain_;
+  social_retreat_distance_ = params.social_retreat_distance_;
+  min_linear_vel_ = params.min_linear_vel_;
   control_horizon_ = params.control_horizon_;
   parameter_block_length_ = params.parameter_block_length_;
   max_time = params.max_time;
@@ -262,8 +283,10 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
     double counter_step = counter * time_step;
     if (people.people.size() != 0)
     {
-      auto* social_work_function_f = SocialWorkCost::Create(socialwork_w_, people_proj[i + 1], evolving_poses[0].pose,
-                                                            counter_step, i, time_step, control_horizon, block_length);
+      auto* social_work_function_f = SocialWorkCost::Create(
+          socialwork_w_, people_proj[i + 1], evolving_poses[0].pose, counter_step, i, time_step, control_horizon,
+          block_length, social_clear_distance_, social_safety_distance_, social_mid_gain_, social_near_gain_,
+          social_retreat_gain_, social_retreat_distance_);
       auto* agent_angle_function_f = AgentAngleCost::Create(agent_angle_w_, people_proj[i + 1], evolving_poses[0].pose,
                                                             i, time_step, control_horizon, block_length);
       auto* proxemics_function_f = ProxemicsCost::Create(proxemics_w_, people_proj[i + 1], evolving_poses[0].pose,
@@ -323,44 +346,44 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
     problem.AddResidualBlock(velocity_function_f, NULL, parameter_blocks);
     problem.AddResidualBlock(goal_align_cost_function_f, NULL, parameter_blocks);
 
-    // add the positions to optimize
-    Eigen::Matrix<double, 2, 1> point(optim_positions[i + 1].params[0], optim_positions[i + 1].params[1]);
-
-    // add the cost functions for the path following and alignment
-    auto* path_follow_cost_function_f = DistanceCost::Create(
-        distance_w_, final_trajectorized_point, evolving_poses[0].pose, i, time_step, control_horizon, block_length);
-    // add the angle cost function, which is used to align the robot with the path
-    auto* path_align_cost_function_f =
-        DistanceCost::Create(angle_w_, point, evolving_poses[0].pose, i, time_step, control_horizon, block_length);
-
-    // add the obstacle cost function, which is used to avoid obstacles
-    // the obstacle cost function is used to avoid obstacles, it takes the costmap and the interpolator as parameters
+    // add the obstacle cost function (front)
     auto* obs_cost_function_f = ObstacleCost::Create(obstacle_w_, costmap, costmap_interpolator, evolving_poses[0].pose,
                                                      i, time_step, control_horizon, block_length);
-    if (i < control_horizon)
+
     {
-      for (unsigned int j = 0; j <= i / block_length; j++)
+      // add the positions to optimize
+      Eigen::Matrix<double, 2, 1> point(optim_positions[i + 1].params[0], optim_positions[i + 1].params[1]);
+
+      auto* path_follow_cost_function_f = DistanceCost::Create(
+          distance_w_, final_trajectorized_point, evolving_poses[0].pose, i, time_step, control_horizon, block_length);
+      auto* path_align_cost_function_f =
+          DistanceCost::Create(angle_w_, point, evolving_poses[0].pose, i, time_step, control_horizon, block_length);
+
+      if (i < control_horizon)
       {
-        path_follow_cost_function_f->AddParameterBlock(2);  // Each velocity block has 2 params (v, ω)
-        path_align_cost_function_f->AddParameterBlock(2);   // Each velocity block has 2 params (v, ω)
-        obs_cost_function_f->AddParameterBlock(2);
+        for (unsigned int j = 0; j <= i / block_length; j++)
+        {
+          path_follow_cost_function_f->AddParameterBlock(2);
+          path_align_cost_function_f->AddParameterBlock(2);
+          obs_cost_function_f->AddParameterBlock(2);
+        }
       }
-    }
-    else
-    {
-      for (unsigned int j = 0; j <= (control_horizon - 1) / block_length; j++)
+      else
       {
-        path_follow_cost_function_f->AddParameterBlock(2);  // Each velocity block has 2 params (v, ω)
-        path_align_cost_function_f->AddParameterBlock(2);   // Each velocity block has 2 params (v, ω)
-        obs_cost_function_f->AddParameterBlock(2);
+        for (unsigned int j = 0; j <= (control_horizon - 1) / block_length; j++)
+        {
+          path_follow_cost_function_f->AddParameterBlock(2);
+          path_align_cost_function_f->AddParameterBlock(2);
+          obs_cost_function_f->AddParameterBlock(2);
+        }
       }
+      path_follow_cost_function_f->SetNumResiduals(1);
+      path_align_cost_function_f->SetNumResiduals(1);
+      obs_cost_function_f->SetNumResiduals(1);
+      problem.AddResidualBlock(path_follow_cost_function_f, NULL, parameter_blocks);
+      problem.AddResidualBlock(path_align_cost_function_f, NULL, parameter_blocks);
+      problem.AddResidualBlock(obs_cost_function_f, NULL, parameter_blocks);
     }
-    path_follow_cost_function_f->SetNumResiduals(1);
-    path_align_cost_function_f->SetNumResiduals(1);
-    obs_cost_function_f->SetNumResiduals(1);
-    problem.AddResidualBlock(path_follow_cost_function_f, NULL, parameter_blocks);
-    problem.AddResidualBlock(path_align_cost_function_f, NULL, parameter_blocks);
-    problem.AddResidualBlock(obs_cost_function_f, NULL, parameter_blocks);
     if (i != 0 && i < control_horizon / block_length)
     {
       auto* velocity_feasibility_cost_function_f =
@@ -372,14 +395,23 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
 
   for (unsigned int i = 0; i < control_horizon / block_length; i++)
   {
-    problem.SetParameterLowerBound(optim_velocities[i].params, 0, 0.0);   // lower bound for linear velocity
-    problem.SetParameterUpperBound(optim_velocities[i].params, 0, 0.6);   // upper bound for linear velocity
-    problem.SetParameterLowerBound(optim_velocities[i].params, 1, -1.4);  // lower bound for angular velocity
-    problem.SetParameterUpperBound(optim_velocities[i].params, 1, 1.4);   // upper bound for angular velocity
+    problem.SetParameterLowerBound(optim_velocities[i].params, 0, min_linear_vel_);
+    problem.SetParameterUpperBound(optim_velocities[i].params, 0, 0.6);
+    problem.SetParameterLowerBound(optim_velocities[i].params, 1, -1.4);
+    problem.SetParameterUpperBound(optim_velocities[i].params, 1,  1.4);
   }
 
   ceres::Solve(options_, &problem, &summary);
   RCLCPP_DEBUG_STREAM(rclcpp::get_logger("optimizer"), "Brief report: " << summary.BriefReport() << std::endl);
+
+  {
+    static rclcpp::Clock opt_dbg_clock(RCL_STEADY_TIME);
+    RCLCPP_INFO_THROTTLE(rclcpp::get_logger("optimizer"), opt_dbg_clock, 500,
+      "[STUCK-DEBUG] ceres term=%s usable=%d iters=%d cost %.3f->%.3f | sol vx=%.3f wz=%.3f (bounds vx[%.2f,0.60] wz[-1.40,1.40])",
+      ceres::TerminationTypeToString(summary.termination_type), summary.IsSolutionUsable(),
+      static_cast<int>(summary.iterations.size()), summary.initial_cost, summary.final_cost,
+      optim_velocities[0].params[0], optim_velocities[0].params[1], min_linear_vel_);
+  }
 
   if (!summary.IsSolutionUsable())
   {
@@ -507,13 +539,14 @@ AgentTrajectory Optimizer::format_to_optimize(nav_msgs::msg::Path& path, const n
     {
       // blend current and previous poses for smoother transition
       geometry_msgs::msg::Pose smoothed;
-      smoothed.position.x = current_path_w * path.poses[i].pose.position.x +
-                            (1.0 - current_path_w) * previous_path.poses[i].pose.position.x;
-      smoothed.position.y = current_path_w * path.poses[i].pose.position.y +
-                            (1.0 - current_path_w) * previous_path.poses[i].pose.position.y;
+      const double path_weight = std::clamp(static_cast<double>(current_path_w), 0.0, 1.0);
+      smoothed.position.x = path_weight * path.poses[i].pose.position.x +
+                            (1.0 - path_weight) * previous_path.poses[i].pose.position.x;
+      smoothed.position.y = path_weight * path.poses[i].pose.position.y +
+                            (1.0 - path_weight) * previous_path.poses[i].pose.position.y;
       double yaw_current = tf2::getYaw(path.poses[i].pose.orientation);
       double yaw_prev = tf2::getYaw(previous_path.poses[i].pose.orientation);
-      double smoothed_yaw = current_path_w * yaw_current + (1.0 - current_path_w) * yaw_prev;
+      double smoothed_yaw = path_weight * yaw_current + (1.0 - path_weight) * yaw_prev;
       tf2::Quaternion q;
       q.setRPY(0, 0, smoothed_yaw);
       smoothed.orientation = tf2::toMsg(q);
@@ -535,15 +568,21 @@ AgentTrajectory Optimizer::format_to_optimize(nav_msgs::msg::Path& path, const n
     }
     else
     {
-      geometry_msgs::msg::TwistStamped cmd_smoothed;
-      cmd_smoothed.twist.linear.x =
-          current_cmds_w * cmds[i - 1].twist.linear.x + (1.0 - current_cmds_w) * previous_cmds[i - 1].twist.linear.x;
-      cmd_smoothed.twist.angular.z =
-          current_cmds_w * cmds[i - 1].twist.angular.z + (1.0 - current_cmds_w) * previous_cmds[i - 1].twist.angular.z;
-      // cmds[i-1] = cmd_smoothed;
-      //  Robot vel
-      r(4, 0) = cmd_smoothed.twist.linear.x;
-      r(5, 0) = cmd_smoothed.twist.angular.z;
+      if (i - 1 >= cmds.size() || i - 1 >= previous_cmds.size())
+      {
+        r(4, 0) = speed.linear.x;
+        r(5, 0) = speed.angular.z;
+      }
+      else
+      {
+        geometry_msgs::msg::TwistStamped cmd_smoothed;
+        cmd_smoothed.twist.linear.x =
+            current_cmds_w * cmds[i - 1].twist.linear.x + (1.0 - current_cmds_w) * previous_cmds[i - 1].twist.linear.x;
+        cmd_smoothed.twist.angular.z =
+            current_cmds_w * cmds[i - 1].twist.angular.z + (1.0 - current_cmds_w) * previous_cmds[i - 1].twist.angular.z;
+        r(4, 0) = cmd_smoothed.twist.linear.x;
+        r(5, 0) = cmd_smoothed.twist.angular.z;
+      }
     }
     robot_status.push_back(r);
   }

@@ -20,8 +20,9 @@ ObstacleCost::ObstacleCost(
   double weight, const nav2_costmap_2d::Costmap2D * costmap,
   const std::shared_ptr<ceres::BiCubicInterpolator<ceres::Grid2D<u_char>>> & costmap_interpolator,
   const geometry_msgs::msg::Pose & robot_init, unsigned int current_position, double time_step,
-  unsigned int control_horizon, unsigned int block_length)
+  unsigned int control_horizon, unsigned int block_length, double offset_sign)
 : weight_(weight),
+  offset_sign_(offset_sign),
   costmap_origin_(costmap->getOriginX(), costmap->getOriginY()),
   costmap_resolution_(costmap->getResolution()),
   costmap_interpolator_(costmap_interpolator)

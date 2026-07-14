@@ -25,6 +25,7 @@
 #include <limits>
 #include <memory>
 #include <queue>
+#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -33,6 +34,7 @@
 #include "ceres/cost_function.h"
 #include "ceres/cubic_interpolation.h"
 #include "nav2_util/node_utils.hpp"
+#include "nav2_costmap_2d/cost_values.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
 
 // cost functions
@@ -90,6 +92,13 @@ struct OptimizerParams
   double goal_align_w_;
   double obstacle_w_;
   double proxemics_w_;
+  double social_clear_distance_;
+  double social_safety_distance_;
+  double social_mid_gain_;
+  double social_near_gain_;
+  double social_retreat_gain_;
+  double social_retreat_distance_;
+  double min_linear_vel_;
   float current_path_w;
   float current_cmds_w;
   float max_time;
@@ -232,6 +241,13 @@ private:
   double curvature_w_;
   double proxemics_w_;
   double curvature_angle_min_;
+  double social_clear_distance_;
+  double social_safety_distance_;
+  double social_mid_gain_;
+  double social_near_gain_;
+  double social_retreat_gain_;
+  double social_retreat_distance_;
+  double min_linear_vel_;
   float current_path_w;
   float current_cmds_w;
   ceres::Solver::Options options_;
