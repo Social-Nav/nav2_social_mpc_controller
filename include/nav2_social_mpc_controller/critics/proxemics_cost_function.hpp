@@ -126,6 +126,7 @@ public:
   T computeProxemics(const Eigen::Matrix<T, 6, 1>& me, const Eigen::Matrix<T, 6, 3>& agents) const
   {
     T min_distance((T)std::numeric_limits<T>::max());  // Initialize minimum distance to a large value
+    bool any_valid = false;                            // whether any valid agent updated min_distance
     Eigen::Matrix<T, 2, 1> mePos(me[0], me[1]);        // Extract the position of the robot
     Eigen::Matrix<T, 2, 1> meVel(me[4] * ceres::cos(me[2]),
                                  me[4] * ceres::sin(me[2]));  // Extract the velocity of the robot
@@ -144,6 +145,14 @@ public:
         diff = Eigen::Matrix<T, 2, 1>((T)1e-6, (T)0.0);  // Use a fixed small direction
       }
       min_distance = std::min(min_distance, squared_distance);  // Update the minimum distance
+      any_valid = true;
+    }
+    // No valid agent updated min_distance -> it is still numeric_limits::max().
+    // exp(-max / d0^2) overflows to -inf and its Jet derivative becomes NaN,
+    // which makes Ceres' initial residual/Jacobian evaluation fail. Return 0 instead.
+    if (!any_valid)
+    {
+      return (T)0.0;
     }
     T proxemics_cost =
         (T)alpha_ * ceres::exp(-min_distance / ((T)d0_ * (T)d0_));  // Exponential decay based on distance

@@ -27,6 +27,8 @@ ObstacleCost::ObstacleCost(
   costmap_resolution_(costmap->getResolution()),
   costmap_interpolator_(costmap_interpolator)
 {
+  size_x_ = costmap->getSizeInCellsX();
+  size_y_ = costmap->getSizeInCellsY();
   control_horizon_ = control_horizon;
   robot_init_ = robot_init;
   current_position_ = current_position;

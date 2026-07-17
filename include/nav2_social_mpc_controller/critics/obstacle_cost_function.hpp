@@ -66,6 +66,12 @@
 namespace nav2_social_mpc_controller
 {
 
+// Extract the scalar value from either a plain double or a ceres::Jet, so
+// bounds checks in the autodiff operator() work for both value and Jacobian passes.
+inline double obstacle_cost_scalar(double v) { return v; }
+template <typename T, int N>
+inline double obstacle_cost_scalar(const ceres::Jet<T, N> & v) { return v.a; }
+
 class ObstacleCost
 {
 public:
@@ -93,6 +99,13 @@ public:
     const std::shared_ptr<ceres::BiCubicInterpolator<ceres::Grid2D<u_char>>> & costmap_interpolator,
     const geometry_msgs::msg::Pose & robot_init, unsigned int current_position, double time_step,
     unsigned int control_horizon, unsigned int block_length, double offset_sign = 1.0);
+
+  // Grid extents (cells), stored so operator() can reject out-of-bounds sample
+  // points instead of relying on ceres::Grid2D's clamp-to-edge extrapolation,
+  // which reads the rolling costmap's border cells (often NO_INFORMATION=255 or
+  // stale inflation) and manifests as a phantom obstacle outside the visible window.
+  unsigned int size_x_ = 0;
+  unsigned int size_y_ = 0;
 
   /**
   * @brief Creates a Ceres cost function for the ObstacleCost.
@@ -157,6 +170,20 @@ public:
     Eigen::Matrix<T, 2, 1> front(front_x, front_y);
     Eigen::Matrix<T, 2, 1> interp_front =
       (front - costmap_origin_.template cast<T>()) / (T)costmap_resolution_;
+
+    // Reject sample points outside the costmap. ceres::Grid2D clamps out-of-range
+    // indices to the edge cell and extrapolates, so a point beyond the rolling
+    // window would read the border value (NO_INFORMATION / stale inflation) as a
+    // phantom obstacle. Treat anything outside (with a 1-cell BiCubic margin) as
+    // zero cost so the robot is not stopped by the edge of its own local window.
+    const double col = obstacle_cost_scalar(interp_front[0]);  // scalar value of col index
+    const double row = obstacle_cost_scalar(interp_front[1]);  // scalar value of row index
+    if (col < 1.0 || row < 1.0 || col > static_cast<double>(size_x_) - 2.0 ||
+        row > static_cast<double>(size_y_) - 2.0)
+    {
+      residuals[0] = (T)0.0;
+      return true;
+    }
 
     costmap_interpolator_->Evaluate(interp_front[1], interp_front[0], &value_front);
 

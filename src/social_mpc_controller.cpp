@@ -177,6 +177,14 @@ geometry_msgs::msg::TwistStamped SocialMPCController::computeVelocityCommands(
     auto & goal_pose = transformed_plan.poses.back().pose;
     if (goal_checker->isGoalReached(robot_pose.pose, goal_pose, speed))
     {
+      // [STOP-DIAG] Fully silent zero-velocity path. If this fires mid-route, the
+      // windowed goal (truncated plan back()) was wrongly judged "reached".
+      double dgoal = std::hypot(goal_pose.position.x - robot_pose.pose.position.x,
+                                goal_pose.position.y - robot_pose.pose.position.y);
+      RCLCPP_WARN(logger_,
+        "[STOP-DIAG] goal_checker->isGoalReached=TRUE -> returning ZERO. dist_to_windowed_goal=%.3f "
+        "odom_vx=%.3f | plan_poses=%zu (this is the fully-silent stop path)",
+        dgoal, speed.linear.x, transformed_plan.poses.size());
       geometry_msgs::msg::TwistStamped cmd_vel;
       cmd_vel.header = robot_pose.header;
       return cmd_vel;
@@ -273,51 +281,10 @@ geometry_msgs::msg::TwistStamped SocialMPCController::computeVelocityCommands(
   cmd_vel.twist.linear.y = 0;
   cmd_vel.twist.angular.z = cmds[0].twist.angular.z;
 
-  // [STUCK-DEBUG] Large-heading-error in-place turn override:
-  // When the path ahead requires a heading change larger than this threshold
-  // (i.e. a U-turn / sharp turn), force zero linear velocity so the robot spins
-  // in place with zero turning radius instead of carving an arc it cannot fit in
-  // a narrow space. Threshold is expressed in radians.
-  const double inplace_turn_min_angle = 1.5708;  // 90 degrees
-  {
-    double robot_yaw = tf2::getYaw(robot_pose.pose.orientation);
-    double rx = robot_pose.pose.position.x;
-    double ry = robot_pose.pose.position.y;
-    // find first pose on the (global-frame) plan that is far enough ahead
-    double heading_err = 0.0;
-    bool found = false;
-    for (const auto & ps : transformed_plan.poses)
-    {
-      double dx = ps.pose.position.x - rx;
-      double dy = ps.pose.position.y - ry;
-      if ((dx * dx + dy * dy) >= 0.25)  // > 0.5 m away
-      {
-        double dir = atan2(dy, dx);
-        heading_err = angles::shortest_angular_distance(robot_yaw, dir);
-        found = true;
-        break;
-      }
-    }
-    if (found && fabs(heading_err) > inplace_turn_min_angle)
-    {
-      // Pure in-place rotation: zero the linear velocity AND take over the angular
-      // velocity toward the target heading. Leaving wz to the optimizer makes it
-      // oscillate/stall on large turns (it keeps trying to follow the path forward).
-      // Use a proportional law (clamped) so the turn is brisk at large errors and
-      // eases in as it aligns, instead of a bang-bang command that jerks at handoff.
-      const double inplace_kp = 2.0;         // rad/s per rad of heading error
-      const double inplace_max_vel = 1.4;    // rad/s ceiling (matches optimizer wz bound)
-      const double inplace_min_vel = 0.6;    // rad/s floor, so it never crawls/stalls
-      double mag = std::clamp(inplace_kp * fabs(heading_err), inplace_min_vel, inplace_max_vel);
-      cmd_vel.twist.linear.x = 0.0;
-      cmd_vel.twist.angular.z = std::copysign(mag, heading_err);
-      static rclcpp::Clock inplace_dbg_clock(RCL_STEADY_TIME);
-      RCLCPP_WARN_THROTTLE(logger_, inplace_dbg_clock, 500,
-        "[STUCK-DEBUG] IN-PLACE TURN: heading_err=%.1f deg -> wz_cmd=%.3f | actual wz=%.3f vx=%.3f (opt wanted wz=%.3f)",
-        heading_err * 180.0 / M_PI, cmd_vel.twist.angular.z, speed.angular.z, speed.linear.x,
-        cmds[0].twist.angular.z);
-    }
-  }
+  // NOTE: the hand-written large-heading in-place-turn override was removed here.
+  // Sharp-turn in-place rotation is now owned entirely by the nav2 RotationShimController
+  // wrapper (tuned via its `angular_dist_threshold`), so cmd_vel is left as the optimizer
+  // output above. This avoids two competing in-place mechanisms fighting on cmd_vel.
 
   RCLCPP_DEBUG(logger_, "cmd_vel: %f, %f", cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
   static rclcpp::Clock stuck_dbg_clock(RCL_STEADY_TIME);
@@ -325,6 +292,19 @@ geometry_msgs::msg::TwistStamped SocialMPCController::computeVelocityCommands(
     "[STUCK-DEBUG] optimized=%d | out vx=%.3f wz=%.3f | ref(pre-opt) vx=%.3f wz=%.3f | people_in_fov=%zu",
     optimized, cmd_vel.twist.linear.x, cmd_vel.twist.angular.z,
     init_cmds[0].twist.linear.x, init_cmds[0].twist.angular.z, people.people.size());
+
+  // [STOP-DIAG] Unthrottled diagnosis of a silent mid-path stop. Fires only when
+  // the returned forward velocity is ~0 while a real plan still exists, so it
+  // pinpoints WHY we stopped without spamming during normal motion.
+  if (std::fabs(cmd_vel.twist.linear.x) < 0.05 && transformed_plan.poses.size() >= 2)
+  {
+    RCLCPP_WARN(logger_,
+      "[STOP-DIAG] STOPPED vx=%.3f wz=%.3f | optimized=%d | ref_vx=%.3f (trajectorizer wanted this) | "
+      "people_in_fov=%zu | odom_vx=%.3f odom_wz=%.3f | plan_poses=%zu | goal_reached=NO",
+      cmd_vel.twist.linear.x, cmd_vel.twist.angular.z, optimized,
+      init_cmds[0].twist.linear.x, people.people.size(),
+      speed.linear.x, speed.angular.z, transformed_plan.poses.size());
+  }
   return cmd_vel;
 }
 

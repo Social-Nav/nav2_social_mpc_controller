@@ -96,8 +96,6 @@ struct OptimizerParams
   double social_safety_distance_;
   double social_mid_gain_;
   double social_near_gain_;
-  double social_retreat_gain_;
-  double social_retreat_distance_;
   double min_linear_vel_;
   float current_path_w;
   float current_cmds_w;
@@ -245,8 +243,6 @@ private:
   double social_safety_distance_;
   double social_mid_gain_;
   double social_near_gain_;
-  double social_retreat_gain_;
-  double social_retreat_distance_;
   double min_linear_vel_;
   float current_path_w;
   float current_cmds_w;

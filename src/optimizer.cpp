@@ -81,10 +81,6 @@ void OptimizerParams::get(rclcpp_lifecycle::LifecycleNode* node, const std::stri
   node->get_parameter(weights + "social_mid_gain", social_mid_gain_);
   nav2_util::declare_parameter_if_not_declared(node, weights + "social_near_gain", rclcpp::ParameterValue(6.0));
   node->get_parameter(weights + "social_near_gain", social_near_gain_);
-  nav2_util::declare_parameter_if_not_declared(node, weights + "social_retreat_gain", rclcpp::ParameterValue(8.0));
-  node->get_parameter(weights + "social_retreat_gain", social_retreat_gain_);
-  nav2_util::declare_parameter_if_not_declared(node, weights + "social_retreat_distance", rclcpp::ParameterValue(2.0));
-  node->get_parameter(weights + "social_retreat_distance", social_retreat_distance_);
   nav2_util::declare_parameter_if_not_declared(node, local_name + "min_linear_velocity", rclcpp::ParameterValue(-0.25));
   node->get_parameter(local_name + "min_linear_velocity", min_linear_vel_);
   nav2_util::declare_parameter_if_not_declared(node, local_name + "control_horizon", rclcpp::ParameterValue(5));
@@ -127,8 +123,6 @@ void Optimizer::initialize(const OptimizerParams params)
   social_safety_distance_ = params.social_safety_distance_;
   social_mid_gain_ = params.social_mid_gain_;
   social_near_gain_ = params.social_near_gain_;
-  social_retreat_gain_ = params.social_retreat_gain_;
-  social_retreat_distance_ = params.social_retreat_distance_;
   min_linear_vel_ = params.min_linear_vel_;
   control_horizon_ = params.control_horizon_;
   parameter_block_length_ = params.parameter_block_length_;
@@ -262,6 +256,10 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
   ceres::Problem problem;
   ceres::Solver::Summary summary;
 
+  // [STOP-DIAG] Collect residual-block ids per critic so we can attribute the
+  // final cost to each term when the optimizer stalls vx to ~0.
+  std::vector<ceres::ResidualBlockId> rb_velocity, rb_obstacle, rb_distance, rb_align, rb_goal, rb_social, rb_prox;
+
   // set the value of control horizon, if size of velociteies is smaller than control horizon, set it to the size of
   // velocities also set the block length, if it is larger than the control horizon, set it to the control horizon
   double counter = 0.0;
@@ -285,8 +283,7 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
     {
       auto* social_work_function_f = SocialWorkCost::Create(
           socialwork_w_, people_proj[i + 1], evolving_poses[0].pose, counter_step, i, time_step, control_horizon,
-          block_length, social_clear_distance_, social_safety_distance_, social_mid_gain_, social_near_gain_,
-          social_retreat_gain_, social_retreat_distance_);
+          block_length, social_clear_distance_, social_safety_distance_, social_mid_gain_, social_near_gain_);
       auto* agent_angle_function_f = AgentAngleCost::Create(agent_angle_w_, people_proj[i + 1], evolving_poses[0].pose,
                                                             i, time_step, control_horizon, block_length);
       auto* proxemics_function_f = ProxemicsCost::Create(proxemics_w_, people_proj[i + 1], evolving_poses[0].pose,
@@ -343,8 +340,8 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
     velocity_function_f->SetNumResiduals(1);
     goal_align_cost_function_f->SetNumResiduals(1);
 
-    problem.AddResidualBlock(velocity_function_f, NULL, parameter_blocks);
-    problem.AddResidualBlock(goal_align_cost_function_f, NULL, parameter_blocks);
+    rb_velocity.push_back(problem.AddResidualBlock(velocity_function_f, NULL, parameter_blocks));
+    rb_goal.push_back(problem.AddResidualBlock(goal_align_cost_function_f, NULL, parameter_blocks));
 
     // add the obstacle cost function (front)
     auto* obs_cost_function_f = ObstacleCost::Create(obstacle_w_, costmap, costmap_interpolator, evolving_poses[0].pose,
@@ -380,9 +377,9 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
       path_follow_cost_function_f->SetNumResiduals(1);
       path_align_cost_function_f->SetNumResiduals(1);
       obs_cost_function_f->SetNumResiduals(1);
-      problem.AddResidualBlock(path_follow_cost_function_f, NULL, parameter_blocks);
-      problem.AddResidualBlock(path_align_cost_function_f, NULL, parameter_blocks);
-      problem.AddResidualBlock(obs_cost_function_f, NULL, parameter_blocks);
+      rb_distance.push_back(problem.AddResidualBlock(path_follow_cost_function_f, NULL, parameter_blocks));
+      rb_align.push_back(problem.AddResidualBlock(path_align_cost_function_f, NULL, parameter_blocks));
+      rb_obstacle.push_back(problem.AddResidualBlock(obs_cost_function_f, NULL, parameter_blocks));
     }
     if (i != 0 && i < control_horizon / block_length)
     {
@@ -403,6 +400,30 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
 
   ceres::Solve(options_, &problem, &summary);
   RCLCPP_DEBUG_STREAM(rclcpp::get_logger("optimizer"), "Brief report: " << summary.BriefReport() << std::endl);
+
+  // [STOP-DIAG] When the solved forward velocity is ~0, attribute the final cost
+  // to each critic group so we can see WHICH term is pinning vx to 0 (no people
+  // in FOV means social/prox should be ~0; the culprit is likely obstacle or the
+  // path distance/align terms with a weak velocity gradient).
+  if (summary.IsSolutionUsable() && optim_velocities[0].params[0] < 0.05)
+  {
+    auto group_cost = [&problem](const std::vector<ceres::ResidualBlockId>& ids) -> double {
+      if (ids.empty()) return 0.0;
+      ceres::Problem::EvaluateOptions eo;
+      eo.residual_blocks = ids;
+      double cost = 0.0;
+      problem.Evaluate(eo, &cost, nullptr, nullptr, nullptr);
+      return cost;
+    };
+    static rclcpp::Clock cost_dbg_clock(RCL_STEADY_TIME);
+    RCLCPP_WARN_THROTTLE(rclcpp::get_logger("optimizer"), cost_dbg_clock, 300,
+      "[STOP-DIAG] vx=%.3f pinned. cost-by-critic: velocity=%.3f obstacle=%.3f distance=%.3f "
+      "align=%.3f goal=%.3f social=%.3f prox=%.3f | total=%.3f",
+      optim_velocities[0].params[0],
+      group_cost(rb_velocity), group_cost(rb_obstacle), group_cost(rb_distance),
+      group_cost(rb_align), group_cost(rb_goal), group_cost(rb_social), group_cost(rb_prox),
+      summary.final_cost);
+  }
 
   {
     static rclcpp::Clock opt_dbg_clock(RCL_STEADY_TIME);
@@ -631,13 +652,17 @@ AgentsTrajectories Optimizer::project_people(const AgentsStates& init_people, co
     a.goals.push_back(g);
     // Fill the obstacles
 
-    // check if the obstacle distance message is valid
-    // if the map has 100x100 cells
-    // TODO use the costmap to compute the obstacles
-    if (od.info.width == 100 && od.info.height == 100)
+    // Check if the obstacle distance message is actually populated. A real
+    // costmap (e.g. the 100x100 local costmap) is valid; only an empty grid is
+    // not. When empty, still keep the agent (so social critics stay active) but
+    // without an obstacle sample.
+    if (od.distances.empty() || od.indexes.empty() || od.info.width == 0 || od.info.height == 0 ||
+        od.info.resolution <= 0.0)
     {
       RCLCPP_WARN_STREAM(rclcpp::get_logger("optimizer"),
-                         "ObstacleDistance grid is NOT  valid with size: " << od.info.width << "x" << od.info.height);
+                         "ObstacleDistance grid is NOT valid (empty/zero-size); skipping obstacle sample. size: "
+                             << od.info.width << "x" << od.info.height);
+      agents.push_back(a);
       continue;
     }
 
@@ -725,18 +750,28 @@ Eigen::Vector2d Optimizer::computeObstacle(const Eigen::Vector2d& apos,
     throw std::runtime_error("ObstacleDistance grid has invalid resolution");
   }
 
-  // map point (person) to cell in the distance grid
-  unsigned int xcell = (unsigned int)floor((apos[0] - od.info.origin.position.x) / od.info.resolution);
-  unsigned int ycell = (unsigned int)floor((apos[1] - od.info.origin.position.y) / od.info.resolution);
-  // cell to index of the array
+  // map point (person) to cell in the distance grid.
+  // Use signed math first so points below/left of the origin (negative cells)
+  // are detected before the cast to unsigned wraps them to huge values.
+  long xcell_s = (long)floor((apos[0] - od.info.origin.position.x) / od.info.resolution);
+  long ycell_s = (long)floor((apos[1] - od.info.origin.position.y) / od.info.resolution);
 
-  if (xcell >= (unsigned int)od.info.width || ycell >= (unsigned int)od.info.height)
-  {
-    RCLCPP_ERROR_STREAM(rclcpp::get_logger("optimizer"), "ObstacleDistance grid cell out of bounds: xcell="
-                                                             << xcell << ", ycell=" << ycell << ", width="
-                                                             << od.info.width << ", height=" << od.info.height);
-    throw std::runtime_error("ObstacleDistance grid cell out of bounds");
-  }
+  // A pedestrian near the edge of the (small, local) costmap legitimately maps
+  // just outside it. Clamp to the nearest valid cell instead of throwing, which
+  // would abort the whole control cycle. Mirrors the clamping in
+  // obstacle_distance_manager's debug callback.
+  if (xcell_s < 0)
+    xcell_s = 0;
+  else if (xcell_s >= (long)od.info.width)
+    xcell_s = (long)od.info.width - 1;
+  if (ycell_s < 0)
+    ycell_s = 0;
+  else if (ycell_s >= (long)od.info.height)
+    ycell_s = (long)od.info.height - 1;
+
+  unsigned int xcell = (unsigned int)xcell_s;
+  unsigned int ycell = (unsigned int)ycell_s;
+  // cell to index of the array
 
   unsigned int index = xcell + ycell * od.info.width;
 

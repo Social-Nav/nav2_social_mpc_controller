@@ -243,10 +243,15 @@ inline void SocialForceModel::computeSocialForce(unsigned index, std::vector<Age
       continue;
     }
     Eigen::Vector2d diff = agents[i].position - agent.position;
-    Eigen::Vector2d diffDirection = diff.normalized();
+    double diffNorm = diff.norm();
+    if (diffNorm < 1e-6) {
+      continue;  // coincident agents -> diff.normalized() would be NaN; skip this pair
+    }
+    Eigen::Vector2d diffDirection = diff / diffNorm;
     Eigen::Vector2d velDiff = agent.velocity - agents[i].velocity;
     Eigen::Vector2d interactionVector = agent.params.lambda * velDiff + diffDirection;
     double interactionLength = interactionVector.norm();
+    if (interactionLength < 1e-9) interactionLength = 1e-9;  // floor -> avoids /0 here and in B=gamma*interactionLength
     Eigen::Vector2d interactionDirection = interactionVector / interactionLength;
     double a1 = std::atan2(interactionDirection[1], interactionDirection[0]);
     while (a1 <= -M_PI) a1 += 2 * M_PI;
@@ -289,10 +294,15 @@ inline void SocialForceModel::computeSocialForce(Agent & me, std::vector<Agent> 
       continue;
     }
     Eigen::Vector2d diff = agents[i].position - me.position;
-    Eigen::Vector2d diffDirection = diff.normalized();
+    double diffNorm = diff.norm();
+    if (diffNorm < 1e-6) {
+      continue;  // coincident agents -> diff.normalized() would be NaN; skip this pair
+    }
+    Eigen::Vector2d diffDirection = diff / diffNorm;
     Eigen::Vector2d velDiff = me.velocity - agents[i].velocity;
     Eigen::Vector2d interactionVector = me.params.lambda * velDiff + diffDirection;
     double interactionLength = interactionVector.norm();
+    if (interactionLength < 1e-9) interactionLength = 1e-9;  // floor -> avoids /0 here and in B=gamma*interactionLength
     Eigen::Vector2d interactionDirection = interactionVector / interactionLength;
     double a1 = std::atan2(interactionDirection[1], interactionDirection[0]);
     while (a1 <= -M_PI) a1 += 2 * M_PI;

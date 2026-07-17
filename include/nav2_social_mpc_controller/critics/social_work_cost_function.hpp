@@ -61,8 +61,7 @@ public:
   SocialWorkCost(double weight, const AgentsStates& agents_init, const geometry_msgs::msg::Pose& robot_init,
                  const double counter, unsigned int current_position, double time_step, unsigned int control_horizon,
                  unsigned int block_length, double social_clear_distance, double social_safety_distance,
-                 double social_mid_gain, double social_near_gain, double social_retreat_gain,
-                 double social_retreat_distance);
+                 double social_mid_gain, double social_near_gain);
 
   /**
    * @brief Creates a Ceres cost function for the SocialWorkCost.
@@ -87,14 +86,12 @@ public:
                                                unsigned int current_position, double time_step,
                                                unsigned int control_horizon, unsigned int block_length,
                                                double social_clear_distance, double social_safety_distance,
-                                               double social_mid_gain, double social_near_gain,
-                                               double social_retreat_gain, double social_retreat_distance)
+                                               double social_mid_gain, double social_near_gain)
   {
     return new SocialWorkCostFunction(new SocialWorkCost(weight, agents_init, robot_init, counter, current_position,
                                                          time_step, control_horizon, block_length,
                                                          social_clear_distance, social_safety_distance,
-                                                         social_mid_gain, social_near_gain, social_retreat_gain,
-                                                         social_retreat_distance));
+                                                         social_mid_gain, social_near_gain));
   }
 
   /**
@@ -132,7 +129,6 @@ public:
 
     Eigen::Matrix<T, 2, 1> robot_sf = computeSocialForce(robot, agents);  // Compute social force on robot
     T wr = (T)robot_sf.squaredNorm();  // Compute the squared norm of the social force on the robot
-    T retreat_cost = computeRetreatCost(robot, agents);
 
     // compute agents' social work provoked by the robot
     T wp = (T)0.0;
@@ -150,7 +146,7 @@ public:
       Eigen::Matrix<T, 2, 1> agent_sf = computeSocialForce(ag, robot_agent);  // Compute social force on agent
       wp += (T)agent_sf.squaredNorm();  // Accumulate the squared norm of the social force on the agent
     }
-    T total_social_force_magnitude_sq = wr + wp + retreat_cost + (T)1e-6;  // Avoid division by zero
+    T total_social_force_magnitude_sq = wr + wp + (T)1e-6;  // Avoid division by zero
 
     // sum the social works and multiply by the weight
     residual[0] = (T)weight_ * (total_social_force_magnitude_sq);
@@ -263,43 +259,6 @@ public:
     return (T)social_mid_gain_ * normalized * normalized;
   }
 
-  template <typename T>
-  T computeRetreatCost(const Eigen::Matrix<T, 6, 1>& me, const Eigen::Matrix<T, 6, 3>& agents) const
-  {
-    const T retreat_distance = (T)social_retreat_distance_;
-    Eigen::Matrix<T, 2, 1> me_pos(me[0], me[1]);
-    T retreat_cost = (T)0.0;
-
-    for (unsigned int i = 0; i < agents.cols(); i++)
-    {
-      if (agents(3, i) == (T)-1.0)
-      {
-        continue;
-      }
-
-      Eigen::Matrix<T, 2, 1> diff = me_pos - Eigen::Matrix<T, 2, 1>(agents(0, i), agents(1, i));
-      T distance = diff.norm();
-      if (distance >= retreat_distance)
-      {
-        continue;
-      }
-
-      if (distance < (T)1e-6)
-      {
-        diff = Eigen::Matrix<T, 2, 1>((T)1e-6, (T)0.0);
-        distance = (T)1e-6;
-      }
-
-      // Strong repulsion along robot→person line, away from person.
-      // Force ~ gain / distance^2, grows rapidly as person approaches.
-      // gain is set large enough to overcome distance_weight * path attraction.
-      T repulsion = (T)social_retreat_gain_ / (distance * distance);
-      retreat_cost += repulsion * repulsion;
-    }
-
-    return retreat_cost;
-  }
-
 private:
   double weight_;
   Eigen::Matrix<double, 6, 3> original_agents_;
@@ -319,8 +278,6 @@ private:
   double social_safety_distance_;
   double social_mid_gain_;
   double social_near_gain_;
-  double social_retreat_gain_;
-  double social_retreat_distance_;
 };
 
 }  // namespace nav2_social_mpc_controller

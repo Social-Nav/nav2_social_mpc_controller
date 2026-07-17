@@ -24,8 +24,7 @@ SocialWorkCost::SocialWorkCost(double weight, const AgentsStates& agents_init,
                                unsigned int current_position, double time_step, unsigned int control_horizon,
                                unsigned int block_length, double social_clear_distance,
                                double social_safety_distance, double social_mid_gain,
-                               double social_near_gain, double social_retreat_gain,
-                               double social_retreat_distance)
+                               double social_near_gain)
   : weight_(weight)
   , robot_init_(robot_init)
   , counter_(counter)
@@ -37,8 +36,6 @@ SocialWorkCost::SocialWorkCost(double weight, const AgentsStates& agents_init,
   , social_safety_distance_(social_safety_distance)
   , social_mid_gain_(social_mid_gain)
   , social_near_gain_(social_near_gain)
-  , social_retreat_gain_(social_retreat_gain)
-  , social_retreat_distance_(social_retreat_distance)
 {
   for (unsigned int j = 0; j < agents_init.size(); j++)
   {
@@ -56,8 +53,6 @@ SocialWorkCost::SocialWorkCost(double weight, const AgentsStates& agents_init,
   social_safety_distance_ = std::max(0.05, social_safety_distance_);
   social_mid_gain_ = std::max(0.0, social_mid_gain_);
   social_near_gain_ = std::max(0.0, social_near_gain_);
-  social_retreat_gain_ = std::max(0.0, social_retreat_gain_);
-  social_retreat_distance_ = std::max(0.1, social_retreat_distance_);
 }
 
 }  // namespace nav2_social_mpc_controller
