@@ -416,8 +416,8 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
       return cost;
     };
     static rclcpp::Clock cost_dbg_clock(RCL_STEADY_TIME);
-    RCLCPP_WARN_THROTTLE(rclcpp::get_logger("optimizer"), cost_dbg_clock, 300,
-      "[STOP-DIAG] vx=%.3f pinned. cost-by-critic: velocity=%.3f obstacle=%.3f distance=%.3f "
+    RCLCPP_WARN_THROTTLE(rclcpp::get_logger("optimizer"), cost_dbg_clock, 1000,
+      "[MOTION-DIAG] vx=%.3f pinned. cost-by-critic: velocity=%.3f obstacle=%.3f distance=%.3f "
       "align=%.3f goal=%.3f social=%.3f prox=%.3f | total=%.3f",
       optim_velocities[0].params[0],
       group_cost(rb_velocity), group_cost(rb_obstacle), group_cost(rb_distance),
@@ -426,9 +426,11 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
   }
 
   {
+    // Ceres convergence detail — DEBUG only (enable the optimizer logger's debug
+    // level to see it); not needed for normal motion monitoring.
     static rclcpp::Clock opt_dbg_clock(RCL_STEADY_TIME);
-    RCLCPP_INFO_THROTTLE(rclcpp::get_logger("optimizer"), opt_dbg_clock, 500,
-      "[STUCK-DEBUG] ceres term=%s usable=%d iters=%d cost %.3f->%.3f | sol vx=%.3f wz=%.3f (bounds vx[%.2f,0.60] wz[-1.40,1.40])",
+    RCLCPP_DEBUG_THROTTLE(rclcpp::get_logger("optimizer"), opt_dbg_clock, 500,
+      "[MOTION-OPT] ceres term=%s usable=%d iters=%d cost %.3f->%.3f | sol vx=%.3f wz=%.3f (bounds vx[%.2f,0.60] wz[-1.40,1.40])",
       ceres::TerminationTypeToString(summary.termination_type), summary.IsSolutionUsable(),
       static_cast<int>(summary.iterations.size()), summary.initial_cost, summary.final_cost,
       optim_velocities[0].params[0], optim_velocities[0].params[1], min_linear_vel_);

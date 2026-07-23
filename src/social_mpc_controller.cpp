@@ -165,25 +165,18 @@ geometry_msgs::msg::TwistStamped SocialMPCController::computeVelocityCommands(
   nav_msgs::msg::Path transformed_plan =
       path_handler_->transformGlobalPlan(robot_pose, 4.0);  // TODO: make this a parameter
 
-  {
-    static rclcpp::Clock entry_dbg_clock(RCL_STEADY_TIME);
-    RCLCPP_WARN_THROTTLE(logger_, entry_dbg_clock, 1000,
-      "[STUCK-DEBUG] computeVelocityCommands ENTER | plan_poses=%zu",
-      transformed_plan.poses.size());
-  }
-
   if (goal_checker != nullptr && !transformed_plan.poses.empty())
   {
     auto & goal_pose = transformed_plan.poses.back().pose;
     if (goal_checker->isGoalReached(robot_pose.pose, goal_pose, speed))
     {
-      // [STOP-DIAG] Fully silent zero-velocity path. If this fires mid-route, the
+      // Goal reached -> return zero velocity. If this fires mid-route, the
       // windowed goal (truncated plan back()) was wrongly judged "reached".
       double dgoal = std::hypot(goal_pose.position.x - robot_pose.pose.position.x,
                                 goal_pose.position.y - robot_pose.pose.position.y);
-      RCLCPP_WARN(logger_,
-        "[STOP-DIAG] goal_checker->isGoalReached=TRUE -> returning ZERO. dist_to_windowed_goal=%.3f "
-        "odom_vx=%.3f | plan_poses=%zu (this is the fully-silent stop path)",
+      RCLCPP_INFO(logger_,
+        "[MOTION] state=GOAL | dist_to_windowed_goal=%.3f "
+        "odom_vx=%.3f | plan=%zu",
         dgoal, speed.linear.x, transformed_plan.poses.size());
       geometry_msgs::msg::TwistStamped cmd_vel;
       cmd_vel.header = robot_pose.header;
@@ -287,23 +280,51 @@ geometry_msgs::msg::TwistStamped SocialMPCController::computeVelocityCommands(
   // output above. This avoids two competing in-place mechanisms fighting on cmd_vel.
 
   RCLCPP_DEBUG(logger_, "cmd_vel: %f, %f", cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
-  static rclcpp::Clock stuck_dbg_clock(RCL_STEADY_TIME);
-  RCLCPP_INFO_THROTTLE(logger_, stuck_dbg_clock, 500,
-    "[STUCK-DEBUG] optimized=%d | out vx=%.3f wz=%.3f | ref(pre-opt) vx=%.3f wz=%.3f | people_in_fov=%zu",
-    optimized, cmd_vel.twist.linear.x, cmd_vel.twist.angular.z,
-    init_cmds[0].twist.linear.x, init_cmds[0].twist.angular.z, people.people.size());
+  const double out_vx = cmd_vel.twist.linear.x;
+  const double out_wz = cmd_vel.twist.angular.z;
+  const bool is_stopped = std::fabs(out_vx) < 0.05;
 
-  // [STOP-DIAG] Unthrottled diagnosis of a silent mid-path stop. Fires only when
-  // the returned forward velocity is ~0 while a real plan still exists, so it
-  // pinpoints WHY we stopped without spamming during normal motion.
-  if (std::fabs(cmd_vel.twist.linear.x) < 0.05 && transformed_plan.poses.size() >= 2)
+  // Classify the current motion state for a single, human-readable status line.
+  const char * state;
+  if (!optimized)          state = "OPT_FAIL";   // optimizer failed -> fell back to reference cmds
+  else if (!is_stopped)    state = "MOVING";
+  else if (std::fabs(out_wz) > 0.1) state = "TURNING";  // ~0 forward but rotating in place
+  else                     state = "STOPPED";
+
+  // One status line every cycle (throttled 1s), whatever the state.
+  static rclcpp::Clock motion_clock(RCL_STEADY_TIME);
+  RCLCPP_INFO_THROTTLE(logger_, motion_clock, 1000,
+    "[MOTION] state=%s vx=%.3f wz=%.3f | ref_vx=%.3f | people=%zu | plan=%zu",
+    state, out_vx, out_wz, init_cmds[0].twist.linear.x,
+    people.people.size(), transformed_plan.poses.size());
+
+  // On an unexpected stop (or optimizer failure) with a real plan still present,
+  // emit one diagnostic line explaining WHY: reference vs output velocities, odom,
+  // and the heading error robot->path (a large head_err means we should be turning,
+  // not creeping). The per-critic cost breakdown is logged separately by optimizer.cpp.
+  if ((is_stopped || !optimized) && transformed_plan.poses.size() >= 2)
   {
-    RCLCPP_WARN(logger_,
-      "[STOP-DIAG] STOPPED vx=%.3f wz=%.3f | optimized=%d | ref_vx=%.3f (trajectorizer wanted this) | "
-      "people_in_fov=%zu | odom_vx=%.3f odom_wz=%.3f | plan_poses=%zu | goal_reached=NO",
-      cmd_vel.twist.linear.x, cmd_vel.twist.angular.z, optimized,
-      init_cmds[0].twist.linear.x, people.people.size(),
-      speed.linear.x, speed.angular.z, transformed_plan.poses.size());
+    const double rx = robot_pose.pose.position.x;
+    const double ry = robot_pose.pose.position.y;
+    const double ryaw = tf2::getYaw(robot_pose.pose.orientation);
+    double head_err = 0.0, d_near = -1.0, d_far = -1.0;
+    const auto& ps = transformed_plan.poses;
+    d_near = std::hypot(ps.front().pose.position.x - rx, ps.front().pose.position.y - ry);
+    d_far  = std::hypot(ps.back().pose.position.x - rx,  ps.back().pose.position.y - ry);
+    for (const auto& p : ps) {
+      double dd = std::hypot(p.pose.position.x - rx, p.pose.position.y - ry);
+      if (dd >= 0.5) {
+        double bearing = std::atan2(p.pose.position.y - ry, p.pose.position.x - rx);
+        head_err = angles::shortest_angular_distance(ryaw, bearing);
+        break;
+      }
+    }
+    static rclcpp::Clock diag_clock(RCL_STEADY_TIME);
+    RCLCPP_WARN_THROTTLE(logger_, diag_clock, 1000,
+      "[MOTION-DIAG] %s: ref_vx=%.3f odom_vx=%.3f odom_wz=%.3f | "
+      "head_err_to_path=%.1fdeg | dist path_start=%.2fm path_end=%.2fm | people=%zu",
+      state, init_cmds[0].twist.linear.x, speed.linear.x, speed.angular.z,
+      head_err * 180.0 / M_PI, d_near, d_far, people.people.size());
   }
   return cmd_vel;
 }
