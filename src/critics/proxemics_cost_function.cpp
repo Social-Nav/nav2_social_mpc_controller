@@ -19,7 +19,7 @@ namespace nav2_social_mpc_controller
 
 ProxemicsCost::ProxemicsCost(double weight, const AgentsStates& agents_init, const geometry_msgs::msg::Pose& robot_init,
                              const double counter, unsigned int current_position, double time_step,
-                             unsigned int control_horizon, unsigned int block_length)
+                             unsigned int control_horizon, unsigned int block_length, double d0, double alpha)
   : weight_(weight)
   , robot_init_(robot_init)
   , counter_(counter)
@@ -34,8 +34,12 @@ ProxemicsCost::ProxemicsCost(double weight, const AgentsStates& agents_init, con
         agents_init[j][4], agents_init[j][5];
   }
 
-  alpha_ = 3.0;  // Scaling factor for the proxemics cost
-  d0_ = 0.5;     // Minimum distance for proxemics cost
+  // d0 = length scale of the proxemics Gaussian cost = alpha*exp(-d^2/d0^2). Repulsion-gradient
+  // peak sits at d0/2, effective range ~1.5*d0 (d0=1.0 -> ~1m standoff). alpha = peak scaling.
+  // Both now come from params (FollowPath.optimizer.weights.proxemics_d0/alpha) so a social
+  // profile can retune the pedestrian standoff RANGE at runtime, not just its strength (weight).
+  alpha_ = alpha;
+  d0_ = (d0 > 1e-3) ? d0 : 1e-3;  // guard against div-by-zero in exp(-d^2/d0^2)
 }
 
 }  // namespace nav2_social_mpc_controller

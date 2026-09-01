@@ -64,6 +64,19 @@ public:
   // std::shared_ptr<nav2_costmap_2d::FootprintSubscriber> footprint_sub);
 
   /**
+   * @brief Runtime setter for the pure-pursuit cruising speed. Used by the social-profile
+   * dynamic-parameter path so a scenario can retune the robot's speed near pedestrians
+   * without a relaunch. This is the REAL speed knob (the optimizer's VelocityCost uses a
+   * hardcoded target, so it is not the effective one).
+   */
+  void setDesiredLinearVel(double v) { desired_linear_vel_ = v; }
+  /// Reference-trajectory duration, in seconds. Stored as the derived step count, which is what
+  /// trajectorize() actually loops on. Must equal the optimizer's control_horizon*time_step: the
+  /// optimizer's DistanceCost aims every step at the LAST point this produces.
+  void setMaxTime(double t) { max_steps_ = (double)((int)round(t / time_step_)); }
+  double getTimeStep() const { return time_step_; }
+
+  /**
    * @brief Cleanup controller state machine
    */
   void cleanup();

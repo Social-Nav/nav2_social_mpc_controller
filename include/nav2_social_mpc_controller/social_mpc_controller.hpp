@@ -16,11 +16,13 @@
 #define NAV2_SOCIAL_MPC_CONTROLLER__MPC_CONTROLLER_HPP_
 
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "geometry_msgs/msg/pose2_d.hpp"
+#include "geometry_msgs/msg/twist.hpp"
 #include "nav2_core/controller.hpp"
 #include "nav2_social_mpc_controller/obstacle_distance_interface.hpp"
 #include "nav2_social_mpc_controller/optimizer.hpp"
@@ -29,6 +31,7 @@
 #include "nav2_util/odometry_utils.hpp"
 #include "obstacle_distance_msgs/msg/obstacle_distance.hpp"
 #include "people_msgs/msg/people.hpp"
+#include "std_msgs/msg/bool.hpp"
 #include "pluginlib/class_list_macros.hpp"
 #include "pluginlib/class_loader.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -158,6 +161,10 @@ protected:
   double speed_limit;
   bool percentage;
   double desired_linear_vel_;
+  // Speeds as configured, before setSpeedLimit() scaling. Limits apply against THESE, not the live
+  // values, so repeated calls cannot ratchet toward zero and clearing one restores the config.
+  double base_desired_linear_vel_{0.0};
+  double base_max_linear_vel_{0.0};
   double lookahead_dist_;
   double rotate_to_heading_angular_vel_;
   double max_lookahead_dist_;
@@ -185,6 +192,37 @@ protected:
 
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<visualization_msgs::msg::MarkerArray>> people_traj_pub_;
   std::unique_ptr<mpc::PathHandler> path_handler_;
+
+  // Silence motion/STOP diagnostics while the sim is paused (social_yielding freeze):
+  // during a freeze the robot is deliberately halted, so "STOPPED" logs are noise.
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sim_running_sub_;
+  bool sim_running_{true};
+
+  // --- Command-chain taps, merged into the optimizer's [MOTION-DIAG] line ------------------
+  // A cmd_vx/meas_vx gap says the robot is not flying what the MPC solved, but not WHICH stage
+  // lost it. Chain: solved -> cmd_vel_nav -> smoother -> cmd_vel_smoothed -> collision_monitor
+  // -> cmd_vel -> base. Tapping each stage lets [MOTION-DIAG] name the culprit.
+  // See docs/social_mpc_internals.md for the topology and why the remap exists.
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_nav_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_smoothed_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_out_sub_;
+  double last_cmd_nav_vx_{std::numeric_limits<double>::quiet_NaN()};
+  double last_cmd_smoothed_vx_{std::numeric_limits<double>::quiet_NaN()};
+  double last_cmd_out_vx_{std::numeric_limits<double>::quiet_NaN()};
+  // Arrival time of the last message on each tap. STEADY clock, not sim: it measures whether the
+  // subscription is alive, which must stay meaningful while the sim clock is frozen by a pause.
+  std::shared_ptr<rclcpp::Clock> chain_clock_;
+  rclcpp::Time last_cmd_nav_stamp_;
+  rclcpp::Time last_cmd_smoothed_stamp_;
+  rclcpp::Time last_cmd_out_stamp_;
+
+  // --- Social-profile dynamic parameters -------------------------------------------------
+  // Lets a scenario retune pedestrian weights at RUNTIME (profiles pushed via /set_parameters at
+  // reset). Weights are otherwise read only at configure(), so a runtime push would be ignored.
+  // Runs on controller_server's (single-threaded) executor, serialized with
+  // computeVelocityCommands, so re-initializing the optimizer here cannot race an optimize().
+  rcl_interfaces::msg::SetParametersResult dynamicParametersCallback(std::vector<rclcpp::Parameter> parameters);
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr dyn_params_handler_;
 };
 
 }  // namespace nav2_social_mpc_controller

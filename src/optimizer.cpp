@@ -66,6 +66,10 @@ void OptimizerParams::get(rclcpp_lifecycle::LifecycleNode* node, const std::stri
   node->get_parameter(weights + "agent_angle_weight", agent_angle_w_);
   nav2_util::declare_parameter_if_not_declared(node, weights + "proxemics_weight", rclcpp::ParameterValue(90.0));
   node->get_parameter(weights + "proxemics_weight", proxemics_w_);
+  nav2_util::declare_parameter_if_not_declared(node, weights + "proxemics_d0", rclcpp::ParameterValue(1.0));
+  node->get_parameter(weights + "proxemics_d0", proxemics_d0_);
+  nav2_util::declare_parameter_if_not_declared(node, weights + "proxemics_alpha", rclcpp::ParameterValue(3.0));
+  node->get_parameter(weights + "proxemics_alpha", proxemics_alpha_);
   nav2_util::declare_parameter_if_not_declared(node, weights + "velocity_feasibility_weight",
                                                rclcpp::ParameterValue(0.5));
   node->get_parameter(weights + "velocity_feasibility_weight", velocity_feasibility_w_);
@@ -83,6 +87,17 @@ void OptimizerParams::get(rclcpp_lifecycle::LifecycleNode* node, const std::stri
   node->get_parameter(weights + "social_near_gain", social_near_gain_);
   nav2_util::declare_parameter_if_not_declared(node, local_name + "min_linear_velocity", rclcpp::ParameterValue(-0.25));
   node->get_parameter(local_name + "min_linear_velocity", min_linear_vel_);
+  // Default 0.6 preserves the previous hardcoded ceiling for any config that omits the key.
+  nav2_util::declare_parameter_if_not_declared(node, local_name + "max_linear_velocity", rclcpp::ParameterValue(0.6));
+  node->get_parameter(local_name + "max_linear_velocity", max_linear_vel_);
+  // NOTE the prefix: this lives under trajectorizer., not under the optimizer's local_name. It is
+  // the SAME key the trajectorizer reads, deliberately -- the reference path and the cost that
+  // tracks it must agree on the cruise speed. Declared (not just get) because the optimizer may be
+  // constructed before the trajectorizer on some paths; declare_parameter_if_not_declared is a
+  // no-op if the trajectorizer already declared it, and then get_parameter returns its value.
+  nav2_util::declare_parameter_if_not_declared(node, trajectorizer + "desired_linear_vel",
+                                               rclcpp::ParameterValue(0.4));
+  node->get_parameter(trajectorizer + "desired_linear_vel", desired_linear_vel_);
   nav2_util::declare_parameter_if_not_declared(node, local_name + "control_horizon", rclcpp::ParameterValue(5));
   node->get_parameter(local_name + "control_horizon", control_horizon_);
   nav2_util::declare_parameter_if_not_declared(node, local_name + "parameter_block_length", rclcpp::ParameterValue(5));
@@ -91,7 +106,36 @@ void OptimizerParams::get(rclcpp_lifecycle::LifecycleNode* node, const std::stri
   node->get_parameter(local_name + "current_path_weight", current_path_w);
   nav2_util::declare_parameter_if_not_declared(node, local_name + "current_cmds_weight", rclcpp::ParameterValue(1.0));
   node->get_parameter(local_name + "current_cmds_weight", current_cmds_w);
+  nav2_util::declare_parameter_if_not_declared(node, local_name + "solver_time_budget",
+                                               rclcpp::ParameterValue(0.05));
+  node->get_parameter(local_name + "solver_time_budget", solver_time_budget);
+  nav2_util::declare_parameter_if_not_declared(node, local_name + "max_angular_velocity",
+                                               rclcpp::ParameterValue(1.4));
+  node->get_parameter(local_name + "max_angular_velocity", max_angular_vel_);
   node->get_parameter(trajectorizer + "max_time", max_time);
+
+  // HORIZON ALIGNMENT CHECK. DistanceCost pulls EVERY step of the control horizon toward one point:
+  // the LAST point of the trajectorized reference. So the reference's duration and the control
+  // horizon's duration must match. When max_time > control_horizon*time_step, that endpoint sits
+  // desired_linear_vel*(max_time - horizon) metres further away than the horizon can cover at the
+  // cruise speed, and the 8th-power distance term simply outbids VelocityCost and speeds up to
+  // close the gap -- e.g. 1.5 s reference vs 1.2 s horizon at 0.35 m/s forced ~0.44 m/s.
+  double traj_time;
+  node->get_parameter(trajectorizer + "time_step", traj_time);
+  const double horizon_time = control_horizon_ * traj_time;
+  if (std::fabs(max_time - horizon_time) > 1e-6)
+  {
+    RCLCPP_WARN(node->get_logger(),
+                "[social_mpc] horizon mismatch: trajectorizer.max_time=%.3fs but "
+                "control_horizon*time_step=%.3fs. DistanceCost aims every step at the reference "
+                "ENDPOINT, so this biases cruise speed by ~%.0f%%. Setting max_time=%.3f.",
+                max_time, horizon_time, 100.0 * (max_time / horizon_time - 1.0), horizon_time);
+  }
+  // Correct our OWN copy unconditionally (cheap, idempotent, and this runs on every reinit).
+  // The trajectorizer holds a SEPARATE derived value (max_steps_ = max_time/time_step, computed in
+  // its configure(), which runs BEFORE this) so it cannot be fixed from here -- the controller
+  // calls trajectorizer_->setMaxTime() right after this returns. Both consumers must agree.
+  max_time = horizon_time;
 }
 // constructor and destructor for Optimizer
 Optimizer::Optimizer()
@@ -119,11 +163,16 @@ void Optimizer::initialize(const OptimizerParams params)
   angle_w_ = params.angle_w_;
   agent_angle_w_ = params.agent_angle_w_;
   proxemics_w_ = params.proxemics_w_;
+  proxemics_d0_ = params.proxemics_d0_;
+  proxemics_alpha_ = params.proxemics_alpha_;
   social_clear_distance_ = params.social_clear_distance_;
   social_safety_distance_ = params.social_safety_distance_;
   social_mid_gain_ = params.social_mid_gain_;
   social_near_gain_ = params.social_near_gain_;
   min_linear_vel_ = params.min_linear_vel_;
+  max_linear_vel_ = params.max_linear_vel_;
+  desired_linear_vel_ = params.desired_linear_vel_;
+  max_angular_vel_ = params.max_angular_vel_;
   control_horizon_ = params.control_horizon_;
   parameter_block_length_ = params.parameter_block_length_;
   max_time = params.max_time;
@@ -143,7 +192,9 @@ void Optimizer::initialize(const OptimizerParams params)
   {
     options_.logging_type = ceres::SILENT;
   }
-  options_.max_solver_time_in_seconds = params.max_time;
+  // NOT max_time: that is the reference-trajectory duration and has no bearing on how long Ceres
+  // may block the control loop. Aliasing them gave the solver a 1.5 s budget at 20 Hz.
+  options_.max_solver_time_in_seconds = params.solver_time_budget;
 }
 
 /**
@@ -250,7 +301,9 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
                                                         optim_positions[optim_status.size() - 1].params[1]);
 
   optim_velocities.pop_back();
-  double desired_linear_vel_ = 0.6;
+  // VelocityCost's target is desired_linear_vel_ (from trajectorizer.desired_linear_vel), NOT the
+  // Ceres bound below -- that is max_linear_vel_, a ceiling. Using a ceiling as a tracking target
+  // silently overrides any profile whose cruise speed is lower.
 
   // setting ceres variables
   ceres::Problem problem;
@@ -287,7 +340,8 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
       auto* agent_angle_function_f = AgentAngleCost::Create(agent_angle_w_, people_proj[i + 1], evolving_poses[0].pose,
                                                             i, time_step, control_horizon, block_length);
       auto* proxemics_function_f = ProxemicsCost::Create(proxemics_w_, people_proj[i + 1], evolving_poses[0].pose,
-                                                         counter_step, i, time_step, control_horizon, block_length);
+                                                         counter_step, i, time_step, control_horizon, block_length,
+                                                         proxemics_d0_, proxemics_alpha_);
       if (i < control_horizon)
       {
         for (unsigned int j = 0; j <= i / block_length; j++)
@@ -310,10 +364,17 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
       social_work_function_f->SetNumResiduals(1);
       proxemics_function_f->SetNumResiduals(1);
       problem.AddResidualBlock(agent_angle_function_f, NULL, parameter_blocks);
-      problem.AddResidualBlock(social_work_function_f, NULL, parameter_blocks);
-      problem.AddResidualBlock(proxemics_function_f, NULL, parameter_blocks);
+      // [STOP-DIAG] capture social + proxemics block ids so group_cost() actually
+      // measures them. Previously these were added but never pushed into rb_social/
+      // rb_prox, so the diag printed social=0/prox=0 even with people in FOV — a
+      // FALSE zero that hid the social term as the real vx-killer.
+      rb_social.push_back(problem.AddResidualBlock(social_work_function_f, NULL, parameter_blocks));
+      rb_prox.push_back(problem.AddResidualBlock(proxemics_function_f, NULL, parameter_blocks));
     }
     auto* velocity_function_f =
+        // Target the CRUISE speed, not the ceiling. The ceiling belongs in SetParameterUpperBound
+        // (below) and nowhere else: as a VelocityCost target it becomes a weight^2*(0.8 - vx)^4
+        // pull that ignored trajectorizer.desired_linear_vel entirely.
         VelocityCost::Create(velocity_w_, desired_linear_vel_, i, control_horizon, block_length);
     Eigen::Matrix<double, 2, 1> final_heading(optim_headings.back().params[0], optim_headings.back().params[1]);
     auto* goal_align_cost_function_f = GoalAlignCost::Create(goal_align_w_, final_heading, evolving_poses[0].pose, i,
@@ -393,19 +454,19 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
   for (unsigned int i = 0; i < control_horizon / block_length; i++)
   {
     problem.SetParameterLowerBound(optim_velocities[i].params, 0, min_linear_vel_);
-    problem.SetParameterUpperBound(optim_velocities[i].params, 0, 0.6);
-    problem.SetParameterLowerBound(optim_velocities[i].params, 1, -1.4);
-    problem.SetParameterUpperBound(optim_velocities[i].params, 1,  1.4);
+    problem.SetParameterUpperBound(optim_velocities[i].params, 0, max_linear_vel_);
+    problem.SetParameterLowerBound(optim_velocities[i].params, 1, -max_angular_vel_);
+    problem.SetParameterUpperBound(optim_velocities[i].params, 1,  max_angular_vel_);
   }
 
   ceres::Solve(options_, &problem, &summary);
   RCLCPP_DEBUG_STREAM(rclcpp::get_logger("optimizer"), "Brief report: " << summary.BriefReport() << std::endl);
 
-  // [STOP-DIAG] When the solved forward velocity is ~0, attribute the final cost
-  // to each critic group so we can see WHICH term is pinning vx to 0 (no people
-  // in FOV means social/prox should be ~0; the culprit is likely obstacle or the
-  // path distance/align terms with a weak velocity gradient).
-  if (summary.IsSolutionUsable() && optim_velocities[0].params[0] < 0.05)
+  // Attribute the final cost per critic group (1 Hz) to see WHICH term dominates vx.
+  // Tag: PINNED (vx<0.05) / CREEP (<0.15, dragged down by a critic) / OK.
+  // NOTE the printed numbers are Ceres COSTS (0.5*residual^2), so groups are not comparable
+  // across different residual powers -- see docs/social_mpc_internals.md.
+  if (diagnostics_enabled_ && summary.IsSolutionUsable())
   {
     auto group_cost = [&problem](const std::vector<ceres::ResidualBlockId>& ids) -> double {
       if (ids.empty()) return 0.0;
@@ -415,14 +476,59 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
       problem.Evaluate(eo, &cost, nullptr, nullptr, nullptr);
       return cost;
     };
+    const double vx0 = optim_velocities[0].params[0];
+    const double wz0 = optim_velocities[0].params[1];
+    const char* tag = (vx0 < 0.05) ? "PINNED" : (vx0 < 0.15 ? "CREEP" : "OK");
+    // Measured speed from odom, ~1 cycle old (post-smoother). Printed beside the command because
+    // a PERSISTENT gap means the robot is not flying what we solved -- and then every cost above
+    // describes a trajectory it never flew. The smoother cannot self-correct one: OPEN_LOOP
+    // integrates its own last output, not odom. See docs/social_mpc_internals.md.
+    const double meas_vx = speed.linear.x;
+    const double meas_wz = speed.angular.z;
+    // Blame the FIRST stage that drops >1/3 of the solved vx, walking the chain in order so the
+    // earliest offender wins; if all stages pass it through, the base failed to execute it. Only
+    // evaluated when there is a real gap, so a healthy run just prints blame=ok.
+    //
+    // The per-stage numbers themselves are no longer printed (they made the line unreadable in
+    // normal operation); `blame` is the one-word verdict distilled from them. The taps are still
+    // fed every cycle by set_cmd_chain(), so restoring the full breakdown is a one-line change.
+    const double gap = vx0 - meas_vx;
+    const char* blame = "ok";
+    if (vx0 > 0.05 && gap > 0.15)
+    {
+      const double drop = vx0 / 3.0;
+      auto present = [](double v) { return v == v; };  // false for NaN, no <cmath> needed
+      // BACKTRACK PAST NaN. A missing tap must not break the whole attribution: compare each
+      // stage against the nearest UPSTREAM value that exists, falling back to the solved vx.
+      // Without this a single NaN (e.g. cmd_vel_nav never received) collapsed everything to
+      // INCONCLUSIVE even when solved=0.800 -> smoothed=0.000 was already damning.
+      const double up_of_smoothed = present(chain_nav_vx_) ? chain_nav_vx_ : vx0;
+      const double up_of_out =
+        present(chain_smoothed_vx_) ? chain_smoothed_vx_ : up_of_smoothed;
+      const double up_of_base = present(chain_out_vx_) ? chain_out_vx_ : up_of_out;
+      if (present(chain_nav_vx_) && (vx0 - chain_nav_vx_) > drop)
+        blame = "TOPIC(cmd_vel_nav!=solved)";
+      else if (present(chain_smoothed_vx_) && (up_of_smoothed - chain_smoothed_vx_) > drop)
+        blame = present(chain_nav_vx_) ? "SMOOTHER" : "SMOOTHER-or-TOPIC(nav tap missing)";
+      else if (present(chain_out_vx_) && (up_of_out - chain_out_vx_) > drop)
+        blame = "COLLISION_MONITOR";
+      else if ((up_of_base - meas_vx) > drop)
+        blame = "BASE";   // every stage passed it through; the base did not execute it
+      else
+        blame = "INCONCLUSIVE(spread/missing)";
+    }
     static rclcpp::Clock cost_dbg_clock(RCL_STEADY_TIME);
-    RCLCPP_WARN_THROTTLE(rclcpp::get_logger("optimizer"), cost_dbg_clock, 1000,
-      "[MOTION-DIAG] vx=%.3f pinned. cost-by-critic: velocity=%.3f obstacle=%.3f distance=%.3f "
-      "align=%.3f goal=%.3f social=%.3f prox=%.3f | total=%.3f",
-      optim_velocities[0].params[0],
+    // DEBUG, not WARN: this fires every second for the whole run and drowns real warnings
+    // in a normally-behaving system. It is a diagnostic, so it belongs at the same level as
+    // [MOTION-OPT] below. Turn it back on with --log-level optimizer:=debug.
+    RCLCPP_DEBUG_THROTTLE(rclcpp::get_logger("optimizer"), cost_dbg_clock, 1000,
+      "[MOTION-DIAG] cmd_vx=%.3f cmd_wz=%.3f | meas_vx=%.3f meas_wz=%.3f (d=%+.3f) [%s] "
+      "cost-by-critic: velocity=%.3f obstacle=%.3f distance=%.3f "
+      "align=%.3f goal=%.3f social=%.3f prox=%.3f | total=%.3f | blame=%s",
+      vx0, wz0, meas_vx, meas_wz, meas_vx - vx0, tag,
       group_cost(rb_velocity), group_cost(rb_obstacle), group_cost(rb_distance),
       group_cost(rb_align), group_cost(rb_goal), group_cost(rb_social), group_cost(rb_prox),
-      summary.final_cost);
+      summary.final_cost, blame);
   }
 
   {
@@ -430,10 +536,10 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
     // level to see it); not needed for normal motion monitoring.
     static rclcpp::Clock opt_dbg_clock(RCL_STEADY_TIME);
     RCLCPP_DEBUG_THROTTLE(rclcpp::get_logger("optimizer"), opt_dbg_clock, 500,
-      "[MOTION-OPT] ceres term=%s usable=%d iters=%d cost %.3f->%.3f | sol vx=%.3f wz=%.3f (bounds vx[%.2f,0.60] wz[-1.40,1.40])",
+      "[MOTION-OPT] ceres term=%s usable=%d iters=%d cost %.3f->%.3f | sol vx=%.3f wz=%.3f (bounds vx[%.2f,%.2f] wz[-1.40,1.40])",
       ceres::TerminationTypeToString(summary.termination_type), summary.IsSolutionUsable(),
       static_cast<int>(summary.iterations.size()), summary.initial_cost, summary.final_cost,
-      optim_velocities[0].params[0], optim_velocities[0].params[1], min_linear_vel_);
+      optim_velocities[0].params[0], optim_velocities[0].params[1], min_linear_vel_, max_linear_vel_);
   }
 
   if (!summary.IsSolutionUsable())
@@ -668,7 +774,8 @@ AgentsTrajectories Optimizer::project_people(const AgentsStates& init_people, co
       continue;
     }
 
-    a.obstacles1.push_back(computeObstacle(a.position, od));
+    if (const auto obs = computeObstacle(a.position, od))
+      a.obstacles1.push_back(*obs);
     agents.push_back(a);
   }
 
@@ -677,7 +784,12 @@ AgentsTrajectories Optimizer::project_people(const AgentsStates& init_people, co
   {
     // robot as sfm agent
     sfm_controller::Agent sfmrobot;
-    sfmrobot.desiredVelocity = 0.6;
+    // Was hardcoded 0.6, then wrongly max_linear_vel_. This is the robot's own desiredVelocity
+    // inside the SFM projection of how pedestrians will react to it, so it has to be the speed the
+    // robot actually intends to cruise at -- the ceiling overestimated it (0.8 vs 0.35 in passive)
+    // and made the predicted ped trajectories systematically wrong in exactly the profile that
+    // cares most about them.
+    sfmrobot.desiredVelocity = desired_linear_vel_;
     sfmrobot.radius = 0.5;
     sfmrobot.id = 0;
     sfmrobot.position << robot_path[i][0], robot_path[i][1];
@@ -707,7 +819,8 @@ AgentsTrajectories Optimizer::project_people(const AgentsStates& init_people, co
     for (unsigned int j = 0; j < agents.size(); j++)
     {
       agents[j].obstacles1.clear();
-      agents[j].obstacles1.push_back(computeObstacle(agents[j].position, od));
+      if (const auto obs = computeObstacle(agents[j].position, od))
+        agents[j].obstacles1.push_back(*obs);
     }
 
     // Take the people agents
@@ -736,8 +849,8 @@ AgentsTrajectories Optimizer::project_people(const AgentsStates& init_people, co
   return people_traj;
 }
 
-Eigen::Vector2d Optimizer::computeObstacle(const Eigen::Vector2d& apos,
-                                           const obstacle_distance_msgs::msg::ObstacleDistance& od)
+std::optional<Eigen::Vector2d> Optimizer::computeObstacle(
+    const Eigen::Vector2d& apos, const obstacle_distance_msgs::msg::ObstacleDistance& od)
 {
   if (od.distances.empty() || od.indexes.empty())
   {
@@ -778,9 +891,17 @@ Eigen::Vector2d Optimizer::computeObstacle(const Eigen::Vector2d& apos,
   unsigned int index = xcell + ycell * od.info.width;
 
   float dist = od.distances[index];  // not used
-  unsigned int ob_idx = od.indexes[index];
+  int ob_idx = od.indexes[index];
 
-  if (ob_idx >= od.info.width * od.info.height)
+  // No nearest obstacle for this cell (obstacle-free costmap). Not an error:
+  // callers drop the sample so obstacles1 stays empty and the SFM obstacle force
+  // is zero, rather than inventing a phantom obstacle.
+  if (ob_idx == obstacle_distance_msgs::msg::ObstacleDistance::NO_OBSTACLE)
+  {
+    return std::nullopt;
+  }
+
+  if (ob_idx < 0 || ob_idx >= (int)(od.info.width * od.info.height))
   {
     RCLCPP_ERROR_STREAM(rclcpp::get_logger("optimizer"),
                         "ObstacleDistance grid index out of bounds: ob_idx=" << ob_idx << ", width=" << od.info.width

@@ -24,6 +24,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <queue>
 #include <sstream>
 #include <utility>
@@ -92,11 +93,22 @@ struct OptimizerParams
   double goal_align_w_;
   double obstacle_w_;
   double proxemics_w_;
+  double proxemics_d0_;     // proxemics Gaussian length scale: cost = alpha*exp(-d^2/d0^2)
+  double proxemics_alpha_;  // proxemics peak scaling
   double social_clear_distance_;
   double social_safety_distance_;
   double social_mid_gain_;
   double social_near_gain_;
   double min_linear_vel_;
+  // Hard ceiling on the optimized vx (Ceres upper bound). Must stay <=
+  // velocity_smoother_max_velocity[0], or the smoother clips whatever the MPC emits.
+  double max_linear_vel_;
+  // Cruise TARGET for VelocityCost -- a target, not a bound (that is max_linear_vel_). Read from
+  // <plugin>.trajectorizer.desired_linear_vel so the optimizer chases the same speed the
+  // trajectorizer used for its reference path.
+  double desired_linear_vel_;
+  double solver_time_budget;  // Ceres wall-clock budget. Unrelated to trajectorizer.max_time.
+  double max_angular_vel_;    // Ceres bound on |wz|.
   float current_path_w;
   float current_cmds_w;
   float max_time;
@@ -157,6 +169,31 @@ public:
    * @param params OptimizerParam struct
    */
   void initialize(const OptimizerParams params);
+
+  /**
+   * @brief Enable/disable the [STOP-DIAG] per-critic cost log (silenced while the
+   * sim is paused during a social_yielding freeze).
+   */
+  void set_diagnostics_enabled(bool enabled) { diagnostics_enabled_ = enabled; }
+
+  /**
+   * @brief Feed the downstream command-chain taps so [MOTION-DIAG] can name the stage that
+   * loses vx, instead of only reporting that measured != commanded.
+   *
+   * The controller owns the subscriptions; pushed every cycle right before optimize(). Values are
+   * the PREVIOUS cycle's (publication happens after computeVelocityCommands returns), which is the
+   * right comparison anyway since the measured speed is also ~1 cycle old. NaN = never received.
+   */
+  void set_cmd_chain(double cmd_nav_vx, double cmd_smoothed_vx, double cmd_out_vx,
+                     double nav_age_s, double smoothed_age_s, double out_age_s)
+  {
+    chain_nav_vx_ = cmd_nav_vx;
+    chain_smoothed_vx_ = cmd_smoothed_vx;
+    chain_out_vx_ = cmd_out_vx;
+    chain_nav_age_ = nav_age_s;
+    chain_smoothed_age_ = smoothed_age_s;
+    chain_out_age_ = out_age_s;
+  }
 
   /**
    * @brief Optimize the path using the social MPC controller
@@ -222,9 +259,26 @@ private:
    * @param od Obstacle distances
    * @return Vector to obstacle
    */
-  Eigen::Vector2d computeObstacle(const Eigen::Vector2d& apos, const obstacle_distance_msgs::msg::ObstacleDistance& od);
+  /**
+   * @return the person->obstacle vector, or nullopt when this cell has no
+   * nearest obstacle (obstacle-free costmap).
+   */
+  std::optional<Eigen::Vector2d> computeObstacle(const Eigen::Vector2d& apos,
+                                                 const obstacle_distance_msgs::msg::ObstacleDistance& od);
 
   bool debug_;
+  bool diagnostics_enabled_{true};  // gates [STOP-DIAG]; disabled while sim paused
+  // Downstream command-chain taps, pushed each cycle by set_cmd_chain(). NaN until the
+  // corresponding topic is first received.
+  double chain_nav_vx_{std::numeric_limits<double>::quiet_NaN()};
+  double chain_smoothed_vx_{std::numeric_limits<double>::quiet_NaN()};
+  double chain_out_vx_{std::numeric_limits<double>::quiet_NaN()};
+  // Seconds since each tap last received a message. Needed because the values above are sticky
+  // (never revert to NaN), so a 0.000 is otherwise ambiguous between live zeros and one stale
+  // startup zero -- different causes.
+  double chain_nav_age_{std::numeric_limits<double>::quiet_NaN()};
+  double chain_smoothed_age_{std::numeric_limits<double>::quiet_NaN()};
+  double chain_out_age_{std::numeric_limits<double>::quiet_NaN()};
   unsigned int control_horizon_;
   unsigned int parameter_block_length_;
   float max_time;
@@ -238,12 +292,17 @@ private:
   double velocity_w_;
   double curvature_w_;
   double proxemics_w_;
+  double proxemics_d0_;
+  double proxemics_alpha_;
   double curvature_angle_min_;
   double social_clear_distance_;
   double social_safety_distance_;
   double social_mid_gain_;
   double social_near_gain_;
   double min_linear_vel_;
+  double max_linear_vel_;      // see OptimizerParams::max_linear_vel_ -- a BOUND, not a target
+  double desired_linear_vel_;  // see OptimizerParams::desired_linear_vel_ -- the cruise TARGET
+  double max_angular_vel_;     // see OptimizerParams::max_angular_vel_
   float current_path_w;
   float current_cmds_w;
   ceres::Solver::Options options_;

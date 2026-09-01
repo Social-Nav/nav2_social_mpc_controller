@@ -70,8 +70,71 @@ void SocialMPCController::configure(const rclcpp_lifecycle::LifecycleNode::WeakP
   optimizer_params_.get(node.get(), name);
   optimizer_->initialize(optimizer_params_);
 
+  // HORIZON ALIGNMENT, second half. OptimizerParams::get() clamped its own max_time to
+  // control_horizon*time_step and warned if the config disagreed, but the trajectorizer derived
+  // max_steps_ from the raw config value back in its configure() above, so it needs the corrected
+  // value pushed in. Leaving the two out of step is what made the robot cruise ~25% over its
+  // desired speed: DistanceCost aims every horizon step at the reference's final point, so a
+  // reference longer than the horizon puts that point out of reach at the cruise speed.
+  trajectorizer_->setMaxTime(optimizer_params_.max_time);
+
+  // Snapshot the configured speeds for setSpeedLimit() to scale against.
+  base_desired_linear_vel_ = optimizer_params_.desired_linear_vel_;
+  base_max_linear_vel_ = optimizer_params_.max_linear_vel_;
+  desired_linear_vel_ = optimizer_params_.desired_linear_vel_;
+
+  // Register the dynamic-parameter callback so social profiles can retune the pedestrian-facing
+  // weights (+ trajectorizer speed) at runtime via /set_parameters. See header for threading note.
+  dyn_params_handler_ = node->add_on_set_parameters_callback(
+      std::bind(&SocialMPCController::dynamicParametersCallback, this, std::placeholders::_1));
+
   // people interface
   people_interface_ = std::make_unique<PeopleInterface>(parent);
+
+  // Track sim pause state (Isaac publishes isaac/sim_running latched) so motion/STOP
+  // diagnostics can stay silent while the sim is frozen during a social_yielding pause.
+  {
+    rclcpp::QoS qos(1);
+    qos.transient_local();
+    sim_running_sub_ = node->create_subscription<std_msgs::msg::Bool>(
+      "/isaac/sim_running", qos,
+      [this](std_msgs::msg::Bool::SharedPtr m) { sim_running_ = m->data; });
+  }
+
+  // Command-chain taps, fed to the optimizer each cycle for its [MOTION-DIAG] `chain:` fields
+  // and `blame=`. Relative names so they resolve inside this robot's
+  // namespace, exactly like local_plan below -- an absolute name would break namespaced runs.
+  // cmd_vel_nav is our OWN output read back off the topic: it should equal cmd_vx, and a
+  // mismatch would mean something republishes/intercepts it, which is worth knowing.
+  chain_clock_ = std::make_shared<rclcpp::Clock>(RCL_STEADY_TIME);
+  cmd_nav_sub_ = node->create_subscription<geometry_msgs::msg::Twist>(
+    "cmd_vel_nav", 1,
+    [this](geometry_msgs::msg::Twist::SharedPtr m) {
+      last_cmd_nav_vx_ = m->linear.x;
+      last_cmd_nav_stamp_ = chain_clock_->now();
+    });
+  cmd_smoothed_sub_ = node->create_subscription<geometry_msgs::msg::Twist>(
+    "cmd_vel_smoothed", 1,
+    [this](geometry_msgs::msg::Twist::SharedPtr m) {
+      last_cmd_smoothed_vx_ = m->linear.x;
+      last_cmd_smoothed_stamp_ = chain_clock_->now();
+    });
+  // ABSOLUTE name on purpose. controller_server is launched with the remap
+  // ('cmd_vel' -> 'cmd_vel_nav') that breaks the smoother feedback loop, and a node-level
+  // remap rewrites EVERY name the node creates -- including this plugin's subscriptions. A
+  // relative "cmd_vel" here would therefore be rewritten to cmd_vel_nav, silently making the
+  // `out` tap a duplicate of the `nav` tap and never observing the real end of the chain.
+  // Building the name from the node namespace dodges the remap and stays correct for any
+  // robot namespace.
+  const std::string cmd_out_topic = std::string(node->get_namespace()) + "/cmd_vel";
+  cmd_out_sub_ = node->create_subscription<geometry_msgs::msg::Twist>(
+    cmd_out_topic, 1,
+    [this](geometry_msgs::msg::Twist::SharedPtr m) {
+      last_cmd_out_vx_ = m->linear.x;
+      last_cmd_out_stamp_ = chain_clock_->now();
+    });
+  RCLCPP_DEBUG(logger_, "[MOTION-DIAG] chain taps: nav=%s smooth=%s out=%s",
+               "cmd_vel_nav (relative)", "cmd_vel_smoothed (relative)", cmd_out_topic.c_str());
 
   // path handler
   path_handler_ = std::make_unique<mpc::PathHandler>(transform_tolerance_, tf_, costmap_ros_);
@@ -82,6 +145,82 @@ void SocialMPCController::configure(const rclcpp_lifecycle::LifecycleNode::WeakP
 
   local_path_pub_ = node->create_publisher<nav_msgs::msg::Path>("local_plan", 1);
   people_traj_pub_ = node->create_publisher<visualization_msgs::msg::MarkerArray>("people_projected_trajectory", 1);
+}
+
+rcl_interfaces::msg::SetParametersResult
+SocialMPCController::dynamicParametersCallback(std::vector<rclcpp::Parameter> parameters)
+{
+  rcl_interfaces::msg::SetParametersResult result;
+  result.successful = true;
+
+  const std::string weights = plugin_name_ + ".optimizer.weights.";
+  const std::string traj_vel = plugin_name_ + ".trajectorizer.desired_linear_vel";
+  const std::string max_vel = plugin_name_ + ".optimizer.max_linear_velocity";
+  bool optimizer_reinit_needed = false;
+
+  // NOTE: this is a pre-set callback (Humble has no add_post_set_parameters_callback), so the
+  // NEW values live in `parameters`, not yet on the node. Read them from `parameters` directly.
+  for (const auto& p : parameters)
+  {
+    const std::string& n = p.get_name();
+    if (n == traj_vel && p.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE)
+    {
+      // THE speed knob, and now it reaches both halves of the controller. It feeds the
+      // trajectorizer's pure-pursuit reference speed AND the optimizer's VelocityCost target,
+      // which used to chase max_linear_vel_ instead -- so before this, pushing a profile's cruise
+      // speed only moved the reference path while the cost still pulled toward the ceiling.
+      if (trajectorizer_)
+        trajectorizer_->setDesiredLinearVel(p.as_double());
+      desired_linear_vel_ = p.as_double();
+      optimizer_params_.desired_linear_vel_ = p.as_double();
+      // A profile push redefines what "unlimited" means, so move the setSpeedLimit baseline with
+      // it; otherwise clearing a speed limit later would restore the PREVIOUS profile's speed.
+      base_desired_linear_vel_ = p.as_double();
+      optimizer_reinit_needed = true;  // optimizer reads its members only at initialize()
+      continue;
+    }
+    if (n == max_vel && p.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE)
+    {
+      // Hot-reloadable too, so a profile can bundle the ceiling alongside the cruise speed.
+      // This key is NOT under the weights. prefix, so without this branch a runtime push would
+      // be accepted by rclcpp and then silently ignored — the optimizer only reads its members
+      // at initialize(). Reuse the optimizer_reinit_needed flag to trigger that re-init below.
+      optimizer_params_.max_linear_vel_ = p.as_double();
+      base_max_linear_vel_ = p.as_double();  // see base_desired_linear_vel_ note above
+      optimizer_reinit_needed = true;
+      continue;
+    }
+    if (n.rfind(weights, 0) != 0)
+      continue;  // not one of our weight params
+    // Defensive: a param callback that throws would break EVERY param-set on controller_server.
+    // All weights we hot-reload are doubles; skip anything else under this prefix rather than
+    // risk as_double() throwing.
+    if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE)
+      continue;
+    const std::string key = n.substr(weights.size());
+    const double v = p.as_double();
+    // Pedestrian-facing weights ONLY. obstacle_weight/inflation are intentionally excluded so a
+    // social profile never alters static-obstacle avoidance (they are shared across all obstacles).
+    if (key == "social_weight")            optimizer_params_.socialwork_w_ = v;
+    else if (key == "proxemics_weight")    optimizer_params_.proxemics_w_ = v;
+    else if (key == "proxemics_d0")        optimizer_params_.proxemics_d0_ = v;
+    else if (key == "proxemics_alpha")     optimizer_params_.proxemics_alpha_ = v;
+    else if (key == "social_clear_distance")  optimizer_params_.social_clear_distance_ = v;
+    else if (key == "social_safety_distance") optimizer_params_.social_safety_distance_ = v;
+    else if (key == "social_mid_gain")     optimizer_params_.social_mid_gain_ = v;
+    else if (key == "social_near_gain")    optimizer_params_.social_near_gain_ = v;
+    else continue;  // some other weight we don't hot-reload
+    optimizer_reinit_needed = true;
+  }
+
+  // Re-init the optimizer so it picks up the new values: it reads optimizer_params_ ONLY in
+  // initialize(). Covers both the pedestrian weights and optimizer.max_linear_velocity.
+  if (optimizer_reinit_needed && optimizer_)
+  {
+    optimizer_->initialize(optimizer_params_);
+    RCLCPP_INFO(logger_, "[social-profile] re-initialized optimizer with updated params at runtime");
+  }
+  return result;
 }
 
 void SocialMPCController::cleanup()
@@ -230,8 +369,15 @@ geometry_msgs::msg::TwistStamped SocialMPCController::computeVelocityCommands(
 
   if (people.header.frame_id != transformed_plan.header.frame_id)
   {
-    // transform people to the global frame
-    for (auto p : people.people)
+    // transform people to the global frame.
+    // BUG FIX: this loop used `auto p` (a COPY), so `p.position = out_point.point`
+    // wrote the transformed coord into the copy and threw it away — people.people
+    // kept its ORIGINAL (wrong-frame) coordinates. With /people in `map` and the
+    // plan in `<robot>/odom`, a physically-distant pedestrian then landed inside
+    // the robot's <2m social_clear_distance in numeric terms, so SocialWorkCost
+    // exploded (residual = 700 * |force|^2) and pinned vx→0. Use a reference so
+    // the transform is actually written back. Also update the header frame_id.
+    for (auto& p : people.people)
     {
       geometry_msgs::msg::PointStamped out_point;
       geometry_msgs::msg::PointStamped in_point;
@@ -243,6 +389,7 @@ geometry_msgs::msg::TwistStamped SocialMPCController::computeVelocityCommands(
       }
       p.position = out_point.point;
     }
+    people.header.frame_id = transformed_plan.header.frame_id;
   }
 
   // Get the distance transform
@@ -258,6 +405,22 @@ geometry_msgs::msg::TwistStamped SocialMPCController::computeVelocityCommands(
   float ts = trajectorizer_->getTimeStep();
   AgentsTrajectories projected_people;
 
+  optimizer_->set_diagnostics_enabled(sim_running_);  // silence [STOP-DIAG] while sim paused
+  // Hand the downstream taps to the optimizer so its [MOTION-DIAG] line can name the stage
+  // that loses vx. Pushed here, immediately before optimize(), so the values are as fresh as
+  // the measured speed they are compared against.
+  {
+    // NaN age = never received. A large age with a plausible value = STALE, i.e. the tap saw
+    // one message long ago and nothing since; that is not the same finding as a live value.
+    const auto now_steady = chain_clock_ ? chain_clock_->now() : rclcpp::Time(0, 0, RCL_STEADY_TIME);
+    auto age = [&now_steady](const rclcpp::Time& t) {
+      return (t.nanoseconds() == 0) ? std::numeric_limits<double>::quiet_NaN()
+                                    : (now_steady - t).seconds();
+    };
+    optimizer_->set_cmd_chain(last_cmd_nav_vx_, last_cmd_smoothed_vx_, last_cmd_out_vx_,
+                              age(last_cmd_nav_stamp_), age(last_cmd_smoothed_stamp_),
+                              age(last_cmd_out_stamp_));
+  }
   bool optimized = optimizer_->optimize(traj_path, projected_people, costmap_, transformed_od, cmds, people, speed, ts);
   if (!optimized)
   {
@@ -292,17 +455,36 @@ geometry_msgs::msg::TwistStamped SocialMPCController::computeVelocityCommands(
   else                     state = "STOPPED";
 
   // One status line every cycle (throttled 1s), whatever the state.
+  // Suppressed while the sim is paused (social_yielding freeze): the robot is
+  // deliberately halted then, so [MOTION]/[MOTION-DIAG] "STOPPED" spam is just noise.
+  // Distance to the TRUE final goal (last pose of the un-truncated global plan).
+  // transformGlobalPlan() prunes only the PASSED front of global_plan_, never the
+  // tail, so global_plan_.back() stays the real destination. transformed_plan.back()
+  // is only the local-window end (<= 4m ahead), so it can NOT be used to see "how far
+  // from the goal" — this is why the robot could stop 1.68m short and the old
+  // plan=%zu line gave no clue. dist_goal is the honest remaining distance.
+  double dist_goal = -1.0;
+  {
+    const auto gplan = path_handler_->getPlan();
+    if (!gplan.poses.empty()) {
+      dist_goal = std::hypot(gplan.poses.back().pose.position.x - robot_pose.pose.position.x,
+                             gplan.poses.back().pose.position.y - robot_pose.pose.position.y);
+    }
+  }
+
   static rclcpp::Clock motion_clock(RCL_STEADY_TIME);
-  RCLCPP_INFO_THROTTLE(logger_, motion_clock, 1000,
-    "[MOTION] state=%s vx=%.3f wz=%.3f | ref_vx=%.3f | people=%zu | plan=%zu",
-    state, out_vx, out_wz, init_cmds[0].twist.linear.x,
-    people.people.size(), transformed_plan.poses.size());
+  if (sim_running_) {
+    RCLCPP_INFO_THROTTLE(logger_, motion_clock, 1000,
+      "[MOTION] state=%s vx=%.3f wz=%.3f | ref_vx=%.3f | dist_goal=%.2fm | people=%zu | plan=%zu",
+      state, out_vx, out_wz, init_cmds[0].twist.linear.x,
+      dist_goal, people.people.size(), transformed_plan.poses.size());
+  }
 
   // On an unexpected stop (or optimizer failure) with a real plan still present,
   // emit one diagnostic line explaining WHY: reference vs output velocities, odom,
   // and the heading error robot->path (a large head_err means we should be turning,
   // not creeping). The per-critic cost breakdown is logged separately by optimizer.cpp.
-  if ((is_stopped || !optimized) && transformed_plan.poses.size() >= 2)
+  if (sim_running_ && (is_stopped || !optimized) && transformed_plan.poses.size() >= 2)
   {
     const double rx = robot_pose.pose.position.x;
     const double ry = robot_pose.pose.position.y;
@@ -319,12 +501,21 @@ geometry_msgs::msg::TwistStamped SocialMPCController::computeVelocityCommands(
         break;
       }
     }
+    // dist_goal is carried here too, not only on the [MOTION] INFO line above: that line
+    // is INFO and gets filtered out in practice, so the WARN diag was the only thing
+    // visible -- and it had no honest "how far from the goal" number. path_end is NOT a
+    // substitute: transformed_plan is the local window (<= 4 m ahead), so path_end
+    // saturates near 2.5 m and cannot show the robot stalling far from its destination.
     static rclcpp::Clock diag_clock(RCL_STEADY_TIME);
-    RCLCPP_WARN_THROTTLE(logger_, diag_clock, 1000,
+    // DEBUG, not WARN: emitted once a second for the entire run even when the robot is
+    // driving correctly, which buries genuine warnings. Re-enable when diagnosing motion
+    // with --log-level <controller_logger>:=debug.
+    RCLCPP_DEBUG_THROTTLE(logger_, diag_clock, 1000,
       "[MOTION-DIAG] %s: ref_vx=%.3f odom_vx=%.3f odom_wz=%.3f | "
-      "head_err_to_path=%.1fdeg | dist path_start=%.2fm path_end=%.2fm | people=%zu",
+      "head_err_to_path=%.1fdeg | dist_goal=%.2fm | dist path_start=%.2fm path_end=%.2fm | "
+      "people=%zu",
       state, init_cmds[0].twist.linear.x, speed.linear.x, speed.angular.z,
-      head_err * 180.0 / M_PI, d_near, d_far, people.people.size());
+      head_err * 180.0 / M_PI, dist_goal, d_near, d_far, people.people.size());
   }
   return cmd_vel;
 }
@@ -336,23 +527,51 @@ void SocialMPCController::setPlan(const nav_msgs::msg::Path& path)
 
 void SocialMPCController::setSpeedLimit(const double& speed_limit, const bool& percentage)
 {
-  double speed_limit_ = speed_limit;
-  bool percentage_ = percentage;
-  speed_limit_ = 0;
-  percentage_ = false;
-  double throwaway_vel = 1;
-  // RCLCPP_DEBUG(logger_, "Setting speed limit to %f, percentage %", speed_limit_);
-  if (percentage_)
+  // Previously this whole function was inert: it overwrote its own arguments with 0/false, wrote
+  // the result into a local named `throwaway_vel`, and logged an unrelated member. Every nav2
+  // speed-limiting path (SpeedFilter / speed-restricted zones, and anything else that calls
+  // setSpeedLimit) was therefore silently ignored by this controller.
+  //
+  // Limits are applied against the values from configure(), never against the current effective
+  // ones, so repeated calls cannot ratchet the robot down to zero and clearing restores exactly
+  // the configured speed.
+  double ceiling = base_max_linear_vel_;
+  double cruise = base_desired_linear_vel_;
+
+  // nav2 signals "no limit" with 0.0 (NO_SPEED_LIMIT). Compared literally rather than via the
+  // constant, which is not exposed by the headers this package pulls in.
+  if (speed_limit <= 0.0)
   {
-    throwaway_vel *= (speed_limit_ / 100.0);
-    RCLCPP_DEBUG(logger_, "Speed limit set as percentage: %f%%, resulting speed: %f", speed_limit_,
-                 desired_linear_vel_);
+    RCLCPP_INFO(logger_, "[social_mpc] speed limit cleared, restoring max=%.2f cruise=%.2f", ceiling,
+                cruise);
+  }
+  else if (percentage)
+  {
+    const double frac = std::max(0.0, speed_limit) / 100.0;
+    ceiling *= frac;
+    cruise *= frac;
+    RCLCPP_INFO(logger_, "[social_mpc] speed limit %.1f%% -> max=%.2f cruise=%.2f", speed_limit,
+                ceiling, cruise);
   }
   else
   {
-    throwaway_vel = speed_limit_;
-    RCLCPP_DEBUG(logger_, "Speed limit set as absolute value: %f", desired_linear_vel_);
+    // Absolute m/s. A limit only ever lowers: min() against both, so a limit above the configured
+    // speed is a no-op rather than a licence to exceed max_linear_velocity.
+    const double lim = std::max(0.0, speed_limit);
+    ceiling = std::min(ceiling, lim);
+    cruise = std::min(cruise, lim);
+    RCLCPP_INFO(logger_, "[social_mpc] speed limit %.2f m/s -> max=%.2f cruise=%.2f", speed_limit,
+                ceiling, cruise);
   }
+
+  desired_linear_vel_ = cruise;
+  if (trajectorizer_)
+    trajectorizer_->setDesiredLinearVel(cruise);
+  // Both optimizer copies, or the cost term keeps chasing the unlimited speed.
+  optimizer_params_.max_linear_vel_ = ceiling;
+  optimizer_params_.desired_linear_vel_ = cruise;
+  if (optimizer_)
+    optimizer_->initialize(optimizer_params_);  // optimizer reads its members only here
 }
 
 bool SocialMPCController::transformPose(const std::string frame, const geometry_msgs::msg::PoseStamped& in_pose,

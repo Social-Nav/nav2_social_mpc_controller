@@ -188,6 +188,9 @@ public:
         diff = Eigen::Matrix<T, 2, 1>((T)1e-6, (T)0.0);  // Use a fixed small direction
       }
       T distance = diff.norm();
+      // HARD cutoff (local addition; upstream weights every agent equally). A ped at or beyond
+      // clear_distance contributes nothing at all -- this is why `social` reads exactly 0.000
+      // once the nearest ped passes it, while `prox` (no cutoff) still shows a value.
       if (distance >= (T)social_clear_distance_)
       {
         continue;
@@ -238,6 +241,14 @@ public:
     return meSocialforce;
   }
 
+  /**
+   * @brief Distance weighting for the social force. LOCAL ADDITION -- upstream applies the same
+   * force factor to every agent inside range.
+   *
+   * Three zones: quadratic rise inside safety_distance (near_gain), quadratic decay between
+   * safety and clear (mid_gain), zero beyond clear. Note clear_distance is both the cutoff and
+   * the ramp denominator, so moving it reshapes the whole mid zone even at fixed gains.
+   */
   template <typename T>
   T computeDistanceScale(const T& distance) const
   {

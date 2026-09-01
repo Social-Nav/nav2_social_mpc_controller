@@ -40,7 +40,7 @@ public:
 
   ProxemicsCost(double weight, const AgentsStates& agents_init, const geometry_msgs::msg::Pose& robot_init,
                 const double counter, unsigned int current_position, double time_step, unsigned int control_horizon,
-                unsigned int block_length);
+                unsigned int block_length, double d0 = 1.0, double alpha = 3.0);
 
   /**
    * @brief Creates a Ceres cost function for the ProxemicsCost.
@@ -64,10 +64,11 @@ public:
   inline static ProxemicsCostFunction* Create(double weight, const AgentsStates& agents_init,
                                               const geometry_msgs::msg::Pose& robot_init, const double counter,
                                               unsigned int current_position, double time_step,
-                                              unsigned int control_horizon, unsigned int block_length)
+                                              unsigned int control_horizon, unsigned int block_length,
+                                              double d0 = 1.0, double alpha = 3.0)
   {
     return new ProxemicsCostFunction(new ProxemicsCost(weight, agents_init, robot_init, counter, current_position,
-                                                       time_step, control_horizon, block_length));
+                                                       time_step, control_horizon, block_length, d0, alpha));
   }
 
   /**
