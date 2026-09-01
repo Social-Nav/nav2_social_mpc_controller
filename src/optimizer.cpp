@@ -465,7 +465,7 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
   // Attribute the final cost per critic group (1 Hz) to see WHICH term dominates vx.
   // Tag: PINNED (vx<0.05) / CREEP (<0.15, dragged down by a critic) / OK.
   // NOTE the printed numbers are Ceres COSTS (0.5*residual^2), so groups are not comparable
-  // across different residual powers -- see docs/social_mpc_internals.md.
+  // across different residual powers -- see docs/实现细节.md.
   if (diagnostics_enabled_ && summary.IsSolutionUsable())
   {
     auto group_cost = [&problem](const std::vector<ceres::ResidualBlockId>& ids) -> double {
@@ -482,7 +482,7 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
     // Measured speed from odom, ~1 cycle old (post-smoother). Printed beside the command because
     // a PERSISTENT gap means the robot is not flying what we solved -- and then every cost above
     // describes a trajectory it never flew. The smoother cannot self-correct one: OPEN_LOOP
-    // integrates its own last output, not odom. See docs/social_mpc_internals.md.
+    // integrates its own last output, not odom. See docs/实现细节.md.
     const double meas_vx = speed.linear.x;
     const double meas_wz = speed.angular.z;
     // Blame the FIRST stage that drops >1/3 of the solved vx, walking the chain in order so the

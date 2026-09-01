@@ -202,7 +202,7 @@ protected:
   // A cmd_vx/meas_vx gap says the robot is not flying what the MPC solved, but not WHICH stage
   // lost it. Chain: solved -> cmd_vel_nav -> smoother -> cmd_vel_smoothed -> collision_monitor
   // -> cmd_vel -> base. Tapping each stage lets [MOTION-DIAG] name the culprit.
-  // See docs/social_mpc_internals.md for the topology and why the remap exists.
+  // See docs/实现细节.md for the topology and why the remap exists.
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_nav_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_smoothed_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_out_sub_;
