@@ -28,10 +28,7 @@ set(CMAKE_CXX_STANDARD 17)
 nav2_package()
 
 include_directories(
-  # ARENA: the "to find lightsfm" note here was stale -- this package never
-  # includes <lightsfm/*>, it carries its own include/nav2_social_mpc_controller/sfm.hpp.
-  # Kept only because eigen3 below lives under this prefix.
-  /usr/local/include
+  /usr/local/include  # for eigen3 below
   include
   /usr/local/include/eigen3
   ${CERES_INCLUDES}
