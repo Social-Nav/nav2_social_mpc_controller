@@ -116,6 +116,7 @@ struct OptimizerParams
   int control_horizon_;
   int parameter_block_length_;
   bool debug;
+  bool diagnostics_enabled;
   int max_iterations;
 };
 
@@ -174,7 +175,10 @@ public:
    * @brief Enable/disable the [STOP-DIAG] per-critic cost log (silenced while the
    * sim is paused during a social_yielding freeze).
    */
-  void set_diagnostics_enabled(bool enabled) { diagnostics_enabled_ = enabled; }
+  void set_diagnostics_enabled(bool enabled)
+  {
+    diagnostics_enabled_ = diagnostics_configured_ && enabled;
+  }
 
   /**
    * @brief Feed the downstream command-chain taps so [MOTION-DIAG] can name the stage that
@@ -267,7 +271,8 @@ private:
                                                  const obstacle_distance_msgs::msg::ObstacleDistance& od);
 
   bool debug_;
-  bool diagnostics_enabled_{true};  // gates [STOP-DIAG]; disabled while sim paused
+  bool diagnostics_configured_{true};  // static optimizer.diagnostics_enabled setting
+  bool diagnostics_enabled_{true};     // additionally disabled while sim paused
   // Downstream command-chain taps, pushed each cycle by set_cmd_chain(). NaN until the
   // corresponding topic is first received.
   double chain_nav_vx_{std::numeric_limits<double>::quiet_NaN()};

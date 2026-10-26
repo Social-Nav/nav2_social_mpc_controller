@@ -53,6 +53,9 @@ void OptimizerParams::get(rclcpp_lifecycle::LifecycleNode* node, const std::stri
   node->get_parameter(local_name + "max_iterations", max_iterations);
   nav2_util::declare_parameter_if_not_declared(node, local_name + "debug_optimizer", rclcpp::ParameterValue(false));
   node->get_parameter(local_name + "debug_optimizer", debug);
+  nav2_util::declare_parameter_if_not_declared(
+      node, local_name + "diagnostics_enabled", rclcpp::ParameterValue(true));
+  node->get_parameter(local_name + "diagnostics_enabled", diagnostics_enabled);
 
   nav2_util::declare_parameter_if_not_declared(node, weights + "distance_weight", rclcpp::ParameterValue(3.0));
   node->get_parameter(weights + "distance_weight", distance_w_);
@@ -154,6 +157,8 @@ void Optimizer::initialize(const OptimizerParams params)
   // Initialize the optimizer with the parameters, getting the values from the
   // OptimizerParams struct
   debug_ = params.debug;
+  diagnostics_configured_ = params.diagnostics_enabled;
+  diagnostics_enabled_ = diagnostics_configured_;
   obstacle_w_ = params.obstacle_w_;
   goal_align_w_ = params.goal_align_w_;
   velocity_feasibility_w_ = params.velocity_feasibility_w_;
@@ -309,9 +314,10 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
   ceres::Problem problem;
   ceres::Solver::Summary summary;
 
-  // [STOP-DIAG] Collect residual-block ids per critic so we can attribute the
-  // final cost to each term when the optimizer stalls vx to ~0.
-  std::vector<ceres::ResidualBlockId> rb_velocity, rb_obstacle, rb_distance, rb_align, rb_goal, rb_social, rb_prox;
+  // Collect residual-block ids per critic so the 1 Hz runtime diagnostic can
+  // evaluate the final Ceres cost of every term after solving.
+  std::vector<ceres::ResidualBlockId> rb_velocity, rb_obstacle, rb_distance, rb_align, rb_goal,
+      rb_social, rb_prox, rb_agent_angle, rb_velocity_feasibility;
 
   // set the value of control horizon, if size of velociteies is smaller than control horizon, set it to the size of
   // velocities also set the block length, if it is larger than the control horizon, set it to the control horizon
@@ -363,11 +369,7 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
       agent_angle_function_f->SetNumResiduals(1);
       social_work_function_f->SetNumResiduals(1);
       proxemics_function_f->SetNumResiduals(1);
-      problem.AddResidualBlock(agent_angle_function_f, NULL, parameter_blocks);
-      // [STOP-DIAG] capture social + proxemics block ids so group_cost() actually
-      // measures them. Previously these were added but never pushed into rb_social/
-      // rb_prox, so the diag printed social=0/prox=0 even with people in FOV — a
-      // FALSE zero that hid the social term as the real vx-killer.
+      rb_agent_angle.push_back(problem.AddResidualBlock(agent_angle_function_f, NULL, parameter_blocks));
       rb_social.push_back(problem.AddResidualBlock(social_work_function_f, NULL, parameter_blocks));
       rb_prox.push_back(problem.AddResidualBlock(proxemics_function_f, NULL, parameter_blocks));
     }
@@ -446,8 +448,9 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
     {
       auto* velocity_feasibility_cost_function_f =
           VelocityFeasibilityCost::Create(velocity_feasibility_w_, i, control_horizon);
-      problem.AddResidualBlock(velocity_feasibility_cost_function_f, NULL, optim_velocities[i].params,
-                               optim_velocities[i - 1].params);
+      rb_velocity_feasibility.push_back(problem.AddResidualBlock(
+          velocity_feasibility_cost_function_f, NULL, optim_velocities[i].params,
+          optim_velocities[i - 1].params));
     }
   }
 
@@ -462,10 +465,9 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
   ceres::Solve(options_, &problem, &summary);
   RCLCPP_DEBUG_STREAM(rclcpp::get_logger("optimizer"), "Brief report: " << summary.BriefReport() << std::endl);
 
-  // Attribute the final cost per critic group (1 Hz) to see WHICH term dominates vx.
-  // Tag: PINNED (vx<0.05) / CREEP (<0.15, dragged down by a critic) / OK.
-  // NOTE the printed numbers are Ceres COSTS (0.5*residual^2), so groups are not comparable
-  // across different residual powers -- see docs/实现细节.md.
+  // Attribute the final cost per critic group once per second. The values are
+  // Ceres costs (0.5*residual^2), not raw residuals, so they show which term
+  // is active in the solved objective but are not normalized across critics.
   if (diagnostics_enabled_ && summary.IsSolutionUsable())
   {
     auto group_cost = [&problem](const std::vector<ceres::ResidualBlockId>& ids) -> double {
@@ -479,6 +481,7 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
     const double vx0 = optim_velocities[0].params[0];
     const double wz0 = optim_velocities[0].params[1];
     const char* tag = (vx0 < 0.05) ? "PINNED" : (vx0 < 0.15 ? "CREEP" : "OK");
+    const char* initial_turn = (wz0 > 0.05) ? "LEFT" : (wz0 < -0.05 ? "RIGHT" : "STRAIGHT");
     // Measured speed from odom, ~1 cycle old (post-smoother). Printed beside the command because
     // a PERSISTENT gap means the robot is not flying what we solved -- and then every cost above
     // describes a trajectory it never flew. The smoother cannot self-correct one: OPEN_LOOP
@@ -517,18 +520,24 @@ bool Optimizer::optimize(nav_msgs::msg::Path& path, AgentsTrajectories& people_p
       else
         blame = "INCONCLUSIVE(spread/missing)";
     }
-    static rclcpp::Clock cost_dbg_clock(RCL_STEADY_TIME);
-    // DEBUG, not WARN: this fires every second for the whole run and drowns real warnings
-    // in a normally-behaving system. It is a diagnostic, so it belongs at the same level as
-    // [MOTION-OPT] below. Turn it back on with --log-level optimizer:=debug.
-    RCLCPP_DEBUG_THROTTLE(rclcpp::get_logger("optimizer"), cost_dbg_clock, 1000,
-      "[MOTION-DIAG] cmd_vx=%.3f cmd_wz=%.3f | meas_vx=%.3f meas_wz=%.3f (d=%+.3f) [%s] "
-      "cost-by-critic: velocity=%.3f obstacle=%.3f distance=%.3f "
-      "align=%.3f goal=%.3f social=%.3f prox=%.3f | total=%.3f | blame=%s",
-      vx0, wz0, meas_vx, meas_wz, meas_vx - vx0, tag,
+    static rclcpp::Clock cost_diag_clock(RCL_STEADY_TIME);
+    // Arena launches controller_server at WARN by default. Keep this explicit
+    // diagnostic at WARN so a normal terminal shows the active objective.
+    RCLCPP_WARN_THROTTLE(rclcpp::get_logger("optimizer"), cost_diag_clock, 1000,
+      "[MPC-DIAG] cmd=(vx=%.3f,wz=%.3f,%s) odom=(vx=%.3f,wz=%.3f) [%s] | "
+      "weights: vel=%.1f obs=%.3f dist=%.1f align=%.1f goal=%.1f social=%.1f "
+      "prox=%.1f(d0=%.2f,a=%.2f) agent_angle=%.1f feas=%.1f | "
+      "social_cfg: clear=%.2f safe=%.2f mid=%.2f near=%.2f cruise=%.2f vx_max=%.2f | "
+      "cost: vel=%.3f obs=%.3f dist=%.3f align=%.3f goal=%.3f social=%.3f "
+      "prox=%.3f agent_angle=%.3f feas=%.3f total=%.3f | blame=%s",
+      vx0, wz0, initial_turn, meas_vx, meas_wz, tag,
+      velocity_w_, obstacle_w_, distance_w_, angle_w_, goal_align_w_, socialwork_w_,
+      proxemics_w_, proxemics_d0_, proxemics_alpha_, agent_angle_w_, velocity_feasibility_w_,
+      social_clear_distance_, social_safety_distance_, social_mid_gain_, social_near_gain_,
+      desired_linear_vel_, max_linear_vel_,
       group_cost(rb_velocity), group_cost(rb_obstacle), group_cost(rb_distance),
       group_cost(rb_align), group_cost(rb_goal), group_cost(rb_social), group_cost(rb_prox),
-      summary.final_cost, blame);
+      group_cost(rb_agent_angle), group_cost(rb_velocity_feasibility), summary.final_cost, blame);
   }
 
   {
